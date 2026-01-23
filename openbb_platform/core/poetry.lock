@@ -1856,4 +1856,8 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.14"
+<<<<<<< HEAD
 content-hash = "a92f8976d6e2ee81eed5d5a4020c620ed5646fec886729cceab961ca512df965"
+=======
+content-hash = "c1bdb2f5a8972a3ea16974fbd601b86337e73a57f751667a2078795ef1b52012"
+>>>>>>> upstream/main

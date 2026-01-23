@@ -886,15 +886,24 @@ test = ["charset_normalizer (>=3.3.2,<4.0)", "cryptography (>=42.0.5,<43.0)", "f
 
 [[package]]
 name = "cyclopts"
+<<<<<<< HEAD
 version = "4.4.4"
+=======
+version = "4.4.3"
+>>>>>>> upstream/main
 description = "Intuitive, easy CLIs based on type hints."
 optional = true
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "extra == \"mcp-server\" or extra == \"all\""
 files = [
+<<<<<<< HEAD
     {file = "cyclopts-4.4.4-py3-none-any.whl", hash = "sha256:316f798fe2f2a30cb70e7140cfde2a46617bfbb575d31bbfdc0b2410a447bd83"},
     {file = "cyclopts-4.4.4.tar.gz", hash = "sha256:f30c591c971d974ab4f223e099f881668daed72de713713c984ca41479d393dd"},
+=======
+    {file = "cyclopts-4.4.3-py3-none-any.whl", hash = "sha256:951611a9d4d88d9916716ae281faca9af1cb79b88bb4f22bd0192cff54e7dec6"},
+    {file = "cyclopts-4.4.3.tar.gz", hash = "sha256:03797c71b49a39dcad8324d6655363056fb998e2ba0240940050331a7f63fe65"},
+>>>>>>> upstream/main
 ]
 
 [package.dependencies]
@@ -2650,15 +2659,24 @@ files = [
 
 [[package]]
 name = "narwhals"
+<<<<<<< HEAD
 version = "2.15.0"
+=======
+version = "2.14.0"
+>>>>>>> upstream/main
 description = "Extremely lightweight compatibility layer between dataframe libraries"
 optional = true
 python-versions = ">=3.9"
 groups = ["main"]
 markers = "extra == \"charting\" or extra == \"all\" or extra == \"econometrics\""
 files = [
+<<<<<<< HEAD
     {file = "narwhals-2.15.0-py3-none-any.whl", hash = "sha256:cbfe21ca19d260d9fd67f995ec75c44592d1f106933b03ddd375df7ac841f9d6"},
     {file = "narwhals-2.15.0.tar.gz", hash = "sha256:a9585975b99d95084268445a1fdd881311fa26ef1caa18020d959d5b2ff9a965"},
+=======
+    {file = "narwhals-2.14.0-py3-none-any.whl", hash = "sha256:b56796c9a00179bd757d15282c540024e1d5c910b19b8c9944d836566c030acf"},
+    {file = "narwhals-2.14.0.tar.gz", hash = "sha256:98be155c3599db4d5c211e565c3190c398c87e7bf5b3cdb157dece67641946e0"},
+>>>>>>> upstream/main
 ]
 
 [package.extras]
@@ -5889,15 +5907,24 @@ test = ["argcomplete (>=3.0.3)", "mypy (>=1.7.0)", "pre-commit", "pytest (>=7.0,
 
 [[package]]
 name = "typer"
+<<<<<<< HEAD
 version = "0.21.1"
+=======
+version = "0.21.0"
+>>>>>>> upstream/main
 description = "Typer, build great CLIs. Easy to code. Based on Python type hints."
 optional = true
 python-versions = ">=3.9"
 groups = ["main"]
 markers = "extra == \"mcp-server\" or extra == \"all\""
 files = [
+<<<<<<< HEAD
     {file = "typer-0.21.1-py3-none-any.whl", hash = "sha256:7985e89081c636b88d172c2ee0cfe33c253160994d47bdfdc302defd7d1f1d01"},
     {file = "typer-0.21.1.tar.gz", hash = "sha256:ea835607cd752343b6b2b7ce676893e5a0324082268b48f27aa058bdb7d2145d"},
+=======
+    {file = "typer-0.21.0-py3-none-any.whl", hash = "sha256:c79c01ca6b30af9fd48284058a7056ba0d3bf5cf10d0ff3d0c5b11b68c258ac6"},
+    {file = "typer-0.21.0.tar.gz", hash = "sha256:c87c0d2b6eee3b49c5c64649ec92425492c14488096dfbc8a0c2799b2f6f9c53"},
+>>>>>>> upstream/main
 ]
 
 [package.dependencies]
