@@ -527,7 +527,12 @@ def ai_narrative(symbol: str) -> dict[str, Any]:
     """One-paragraph plain-English summary via Groq, synthesizing all engines."""
     try:
         eng = _import_engines()
-        df    = eng["_fetch_ohlcv"](symbol, years=1)
+        # FIXED [H-CONSISTENCY]: match the Technical tab's 2-year window. A 1-year
+        # window silently dropped any harmonic whose X pivot was >1y old (e.g.
+        # VOLV-B.ST Bearish Deep Crab, X=2025-05-13), so the Overview narrative said
+        # "no harmonic patterns" while the Technical tab listed two. Same df here ->
+        # the narrative now sees the SAME harmonics / RSI / trend as /technical.
+        df    = eng["_fetch_ohlcv"](symbol, years=2)
         info  = eng["_fetch_info"](symbol)
         if df.empty: raise HTTPException(404, f"No data for {symbol}")
         close = df["close"]
@@ -544,10 +549,35 @@ def ai_narrative(symbol: str) -> dict[str, Any]:
         # <- NEW [EW]: cite the COMPUTED preferred/alternate counts (engine, EWI-sourced),
         #    not the legacy .docx phase. Legacy phase kept parenthetically for continuity.
         ew_cited = _ew_cite_phrase(_computed_elliott_payload(symbol, df))
-        # Filter to patterns actually found (found=True), then use the 'pattern' key
-        found_harmonics = [h for h in harmonics if h.get("found", False)] if harmonics else []
+
+        # <- FIXED [H-CONSISTENCY]: surface harmonics the way /chart does — confirmed
+        #    patterns as name + direction + PRZ, and when NONE confirm, the nearest
+        #    near-miss (user: "even if nearest harmonic pattern is found I want it in
+        #    the overview"). The narrative must never claim "no harmonic patterns"
+        #    when one is listed below.
+        def _hfmt(h: dict) -> str:
+            d  = (h.get("direction") or "").strip()
+            lo, hi = h.get("prz_low"), h.get("prz_high")
+            prz = (f"{lo:g}–{hi:g}"
+                   if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) else "n/a")
+            return f"{h.get('pattern')}{(' ' + d) if d else ''} (PRZ {prz})"
+        found_harmonics = [h for h in harmonics if h.get("found")] if harmonics else []
         h_count = len(found_harmonics)
-        h_first = found_harmonics[0].get("pattern") if found_harmonics else None
+        if found_harmonics:
+            h_first = found_harmonics[0].get("pattern")
+            harm_summary = f"{h_count} confirmed: " + "; ".join(_hfmt(h) for h in found_harmonics[:3])
+        else:
+            h_first = None
+            nm = eng["harmonic_near_miss"](swings)
+            if nm:
+                lo, hi = nm.get("prz_low"), nm.get("prz_high")
+                prz = (f"{lo:g}–{hi:g}"
+                       if isinstance(lo, (int, float)) and isinstance(hi, (int, float)) else "n/a")
+                d = (nm.get("direction") or "").strip()
+                harm_summary = (f"0 confirmed; nearest near-miss {nm.get('pattern')}"
+                                f"{(' ' + d) if d else ''} (projected PRZ {prz}, miss {nm.get('miss')})")
+            else:
+                harm_summary = "0 confirmed; no near-miss within tolerance"
         rsi     = ind.get("rsi_val")
         rsi_str = f"{rsi:.1f}" if rsi is not None else "—"   # pre-format for both narrative branches
         trend   = ichi.get("trend", "—")
@@ -559,25 +589,29 @@ def ai_narrative(symbol: str) -> dict[str, Any]:
                     "narrative": (f"{company} ({symbol.upper()}) trades at ${last:.2f}. "
                                   f"Trend: {trend}. Elliott (computed, EWI): {ew_cited} "
                                   f"(legacy phase: {wave}). "
-                                  f"Harmonic patterns detected: {h_count}. "
+                                  f"Harmonic patterns — {harm_summary}. "
                                   f"RSI: {rsi_str}. "
                                   "(Configure GROQ_API_KEY for AI narrative)"),
-                    "ai_powered": False}
+                    "ai_powered": False,
+                    "harmonic_summary": harm_summary, "harmonic_count": h_count}
 
         from data_clients import ai_analyze
         prompt = (f"Write ONE paragraph (max 4 sentences) for {company} ({symbol}) at "
                   f"${last:.2f}. Trend (Ichimoku): {trend}. "
                   f"Elliott Wave (computed per Elliott Wave Principle rules): {ew_cited}. "
                   f"Cite this computed wave count; do not invent a different one. "
-                  f"Harmonic patterns: {h_count} found"
-                  + (f" (top: {h_first})" if h_first else "") +
-                  f". RSI: {rsi_str}. Be specific, professional, no hedging.")
+                  f"Harmonic patterns — {harm_summary}. "
+                  f"State the harmonic finding exactly as given (name, direction, PRZ); "
+                  f"if a near-miss is listed, report it as the nearest harmonic pattern. "
+                  f"NEVER claim there are no harmonic patterns when one is listed above. "
+                  f"RSI: {rsi_str}. Be specific, professional, no hedging.")
         try:
             narrative = ai_analyze(prompt, model="groq")
         except Exception as e:
             narrative = f"AI narrative unavailable: {e}"
         return {"status": "ok", "symbol": symbol.upper(),
-                "narrative": narrative, "ai_powered": True}
+                "narrative": narrative, "ai_powered": True,
+                "harmonic_summary": harm_summary, "harmonic_count": h_count}
     except HTTPException: raise
     except Exception as e:
         logger.exception("ai_narrative %s", symbol)
@@ -912,6 +946,37 @@ def _psych_read(final: str, tally: dict) -> str:
             f"HOLD {tally['HOLD']}, avg conviction {tally['avg_score']}/100.")
 
 
+def _advisor_plan(verdict: str, score: int, price: float, atr: float,
+                  horizon: str, liq_shares: Optional[int]) -> dict[str, Any]:
+    """Per-advisor trade line so EACH of the 10 advisors states an exact entry price,
+    a target, a stop, a holding timeframe, and the volume their conviction implies
+    (user demand: 'specify what volume their opinion is based on and the timeframe for
+    buying and selling … the target must be specified'). Honest: this is the trade the
+    advisor's framework + conviction score imply, not a promise. Target distance and
+    R:R scale with THAT advisor's own score, so a low-conviction BUY targets less."""
+    v = (verdict or "HOLD").upper()
+    if v == "HOLD" or atr <= 0 or price <= 0:
+        return {"stance": "HOLD", "entry": None, "stop": None, "target": None,
+                "expected_rr": None, "horizon": horizon or "—",
+                "size_lean": "No position — stands aside."}
+    long = v == "BUY"
+    move = atr * (2 + 4 * score / 100)            # target distance ~ advisor conviction
+    rr   = round(1 + 2 * score / 100, 2)
+    if long:
+        entry, stop, target = round(price, 2), round(price - 2 * atr, 2), round(price + move, 2)
+    else:                                          # SELL / AVOID -> short side, mirrored
+        entry, stop, target = round(price, 2), round(price + 2 * atr, 2), round(price - move, 2)
+    pct = max(10, min(100, int(round(score))))     # conviction-weighted volume lean
+    if liq_shares:
+        size_lean = (f"conviction {score}/100 → up to ~{int(liq_shares * pct / 100):,} sh "
+                     f"({pct}% of liquidity cap)")
+    else:
+        size_lean = f"conviction {score}/100 → {pct}% of max position"
+    return {"stance": ("BUY" if long else "SELL"), "entry": entry, "stop": stop,
+            "target": target, "expected_rr": rr, "horizon": horizon or "swing",
+            "size_lean": size_lean}
+
+
 def _trade_ticket(symbol: str, price: float, final: str, conviction: int,
                   tally: dict) -> dict[str, Any]:
     """Turn the Chairman's directional call into an executable trade ticket.
@@ -945,11 +1010,39 @@ def _trade_ticket(symbol: str, price: float, final: str, conviction: int,
     expected_move = atr * (2 + 4 * conviction / 100)   # move / 2ATR == rr
     per_share_risk = round(2 * atr, 2)
 
+    # <- NEW [TICKET-DATES]: a concrete entry date + an estimated target/exit date,
+    #    so the AI Analysis states an exact sell-by date (user demand) rather than a
+    #    vague "1–3 weeks". target_date is the midpoint of the swing horizon and is
+    #    labelled an estimate — ATR-projected moves have no guaranteed hit date.
+    from datetime import datetime, timedelta, timezone
+    _today = datetime.now(timezone.utc).date()
+    target_days = 14                                   # midpoint of the ~1–3 week swing horizon
+    entry_date  = _today.isoformat()
+    target_date = (_today + timedelta(days=target_days)).isoformat()
+
+    # <- NEW [TICKET-VOLUME]: a concrete share count is ALWAYS shown via the liquidity
+    #    ceiling (1% of 20-day average $ volume). The server can't know account size,
+    #    so risk-based sizing stays a formula, but this gives a precise fillable volume.
+    liq_shares, liq_note = None, "Liquidity volume unavailable."
+    try:
+        if "volume" in df.columns:
+            advol = float((close * df["volume"]).tail(20).mean())   # 20-day avg $ volume
+            if advol > 0 and last > 0:
+                cap = 0.01 * advol
+                liq_shares = int(cap // last)
+                liq_note = (f"≤ {liq_shares:,} shares (~${cap:,.0f}) stays within 1% of 20-day "
+                            f"avg $ volume — fillable without moving the tape.")
+    except Exception:  # noqa: BLE001
+        pass
+
     if final == "HOLD":  # no trade
         return {
             "available": True, "stance": "HOLD", "direction": "HOLD",
             "entry": None, "stop": None, "target": None, "expected_rr": None,
             "timeframe": "—", "per_share_risk": None,
+            "entry_date": entry_date, "target_date": None, "target_days": None,
+            "liquidity_max_shares": None,
+            "liquidity_note": "No position — liquidity sizing not applicable.",
             "size_basis": "No trade: board is balanced. No position to size.",
             "psychology_read": _psych_read(final, tally),
             "risk_read": f"ATR(14) ${round(atr, 2)} (~{atr_pct:.1f}% of price).",
@@ -980,14 +1073,20 @@ def _trade_ticket(symbol: str, price: float, final: str, conviction: int,
                          if vetoed else "market / next session"),
         "target": target,
         "target_window": "swing horizon (see timeframe)",
+        "target_date": target_date,             # <- NEW: estimated sell-by date
+        "target_days": target_days,
+        "entry_date": entry_date,               # <- NEW: trade-on date
         "stop": stop,
         "stop_reason": "2×ATR(14) beyond entry — structure invalidation",
         "timeframe": "swing · ~1–3 weeks",
         "expected_rr": rr,
         "per_share_risk": per_share_risk,
-        "size_basis": (f"Risk-based: per-share risk ${per_share_risk}. "
-                       f"Size = floor(0.01 × account ÷ {per_share_risk}) shares at "
-                       f"1% account risk. Provide account size for exact shares."),
+        "liquidity_max_shares": liq_shares,     # <- NEW: concrete fillable volume
+        "liquidity_note": liq_note,
+        "size_basis": (f"Liquidity ceiling: {liq_note} "
+                       f"Risk-based: per-share risk ${per_share_risk}; "
+                       f"shares = floor(0.01 × account ÷ ${per_share_risk}) at 1% account risk "
+                       f"(provide account size for the exact risk-based figure)."),
         "psychology_read": _psych_read(final, tally),
         "risk_read": (f"ATR(14) ${round(atr, 2)} (~{atr_pct:.1f}% of price); "
                       f"2×ATR stop ${stop}; R:R {rr} vs gate {_MIN_RR}."),
@@ -1013,6 +1112,26 @@ def chairman(symbol: str) -> dict[str, Any]:
         names = list_frameworks()
         groq_key = os.getenv("GROQ_API_KEY", "")
 
+        # <- NEW [ADVISOR-PLAN]: ATR(14) + a liquidity ceiling, computed ONCE and shared
+        #    by every advisor's per-line plan (entry/stop/target/volume). Best-effort —
+        #    if it fails, advisors still return verdict + thesis (plan degrades to HOLD).
+        _atr, _liq_shares = 0.0, None
+        try:
+            _eng = _import_engines()
+            _df = _eng["_fetch_ohlcv"](symbol, years=1)
+            if not _df.empty:
+                _h, _l, _c = _df["high"], _df["low"], _df["close"]
+                _p = _c.shift(1)
+                _tr = (_h - _l).combine((_h - _p).abs(), max).combine((_l - _p).abs(), max)
+                _atr = float(_tr.tail(14).mean())
+                if "volume" in _df.columns:
+                    _av = float((_c * _df["volume"]).tail(20).mean())
+                    _last = float(_c.iloc[-1])
+                    if _av > 0 and _last > 0:
+                        _liq_shares = int((0.01 * _av) // _last)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("chairman atr/liq %s: %s", symbol, exc)
+
         def _one(name: str) -> dict:
             fw = get_framework(name)
             verdict, score, thesis = "HOLD", 50, ""
@@ -1025,8 +1144,11 @@ def chairman(symbol: str) -> dict[str, Any]:
                     verdict, score, thesis = _parse_fw(raw)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("chairman member %s/%s: %s", symbol, name, exc)
+            horizon = fw.get("horizon", "—")
             return {"key": name, "display_name": fw["display_name"], "verdict": verdict,
-                    "score": score, "thesis": thesis.strip()[:280]}
+                    "score": score, "thesis": thesis.strip()[:280],
+                    "horizon": horizon,
+                    "plan": _advisor_plan(verdict, score, price, _atr, horizon, _liq_shares)}
 
         with ThreadPoolExecutor(max_workers=10) as ex:
             board = list(ex.map(_one, names))
