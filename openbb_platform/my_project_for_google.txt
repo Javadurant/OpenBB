@@ -1,0 +1,552 @@
+from openbb import obb
+
+# Pull historical price data
+data = obb.equity.price.historical("AAPL")
+
+# Convert to pandas DataFrame
+df = data.to_dataframe()
+
+# Basic analysis
+print("\n=== LAST 5 DAYS ===")
+print(df.tail())
+
+print("\n=== SUMMARY ===")
+print(df.describe())
+
+print("\n=== RETURNS (%) ===")
+returns = df["close"].pct_change() * 100
+print(returns.tail())
+from openbb import obb
+
+# List of stocks to analyze
+tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
+
+for ticker in tickers:
+    print("\n==============================")
+    print(f"📊 {ticker} — Historical Prices")
+    print("==============================")
+
+    data = obb.equity.price.historical(ticker)
+    df = data.to_dataframe()
+
+    print(df.tail())  # show latest prices
+# app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from streamlit_searchbox import st_searchbox
+from streamlit_lightweight_charts import renderLightweightCharts 
+
+# Architecture Imports
+from engine.search import get_symbol_suggestions
+from engine.pipeline import run_pipeline
+
+# 1. PRIMARY CONFIGURATION
+st.set_page_config(page_title="OpenBB Workplace AI", layout="wide", initial_sidebar_state="expanded")
+
+# 2026 CSS Styling for High-Quality Workplace
+st.markdown("""
+    <style>
+    .stApp { background-color: #0B0E14; }
+    [data-testid="stMetricValue"] { font-size: 1.4rem; color: #3b82f6; }
+    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
+    .stTabs [data-baseweb="tab"] { 
+        height: 50px; background-color: #161B22; 
+        border-radius: 4px; padding: 10px 25px; color: #848E9C;
+    }
+    .stTabs [aria-selected="true"] { background-color: #1f2937; border-bottom: 2px solid #3b82f6; color: white; }
+    </style>
+""", unsafe_allow_html=True)
+
+# 2. HELPER FUNCTIONS
+def ensure_datetime_index(df: pd.DataFrame):
+    if df is None or df.empty: return df
+    df = df.copy()
+    if not isinstance(df.index, pd.DatetimeIndex): 
+        df.index = pd.to_datetime(df.index)
+    return df
+
+def render_tv_chart(df: pd.DataFrame, plan: dict):
+    """TradingView Lightweight Chart Implementation for Pro-Level Dashboard."""
+    chart_data = df.reset_index()
+    chart_data.columns = [c.lower() for c in chart_data.columns]
+    if 'date' in chart_data.columns: chart_data = chart_data.rename(columns={'date': 'time'})
+    elif 'index' in chart_data.columns: chart_data = chart_data.rename(columns={'index': 'time'})
+    chart_data['time'] = chart_data['time'].astype(str)
+    
+    candles = chart_data[['time', 'open', 'high', 'low', 'close']].to_dict('records')
+    volume = chart_data[['time', 'volume']].rename(columns={'volume': 'value'}).to_dict('records')
+    
+    chart_options = {
+        "height": 600,
+        "layout": {"background": {"type": 'solid', "color": '#0B0E14'}, "textColor": '#d1d4dc'},
+        "grid": {"vertLines": {"color": '#1f2937'}, "horzLines": {"color": '#1f2937'}},
+        "priceScale": {"borderColor": '#2b2b43'},
+        "timeScale": {"borderColor": '#2b2b43'}
+    }
+    
+    series = [
+        {"type": 'Candlestick', "data": candles, "options": {"upColor": '#26a69a', "downColor": '#ef5350'}},
+        {"type": 'Histogram', "data": volume, "options": {"color": 'rgba(38, 166, 154, 0.3)', "priceFormat": {"type": 'volume'}, "priceScaleId": ""}}
+    ]
+    renderLightweightCharts(charts=[{"chart": chart_options, "series": series}])
+
+def render_advanced_theory_chart(df: pd.DataFrame, plan: dict, active_patterns: list, show_ichimoku: bool, show_fibs: bool, osc_selection: list):
+    """High-Fidelity Plotly Chart for Geometric Analysis (Elliott & Harmonics)."""
+    df = ensure_datetime_index(df)
+    
+    if show_ichimoku:
+        df['tenkan'] = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
+        df['kijun'] = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
+
+    rows = 1 + len(osc_selection)
+    row_heights = [0.7] + [0.3 / len(osc_selection)] * len(osc_selection) if osc_selection else [1.0]
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.02, row_heights=row_heights)
+    
+    # Candlestick
+    fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price"), row=1, col=1)
+
+    # Elliott Wave (High-Fidelity Drawing)
+    elliott = plan.get("elliott", {})
+    if "wave_coords" in elliott:
+        coords = elliott["wave_coords"]
+        fig.add_trace(go.Scatter(
+            x=[c['x'] for c in coords], y=[c['y'] for c in coords],
+            mode='lines+markers+text', text=["1", "2", "3"], textposition="top center",
+            line=dict(color='#facc15', width=3, dash='dash'), name="Elliott Path"
+        ), row=1, col=1)
+
+    # Harmonics
+    for p in plan.get("harmonics", []):
+        if p.get('name') in active_patterns:
+            pts = p.get('points', [])
+            if len(pts) >= 5:
+                p_x = [df.index[min(int(pt[0]), len(df)-1)] for pt in pts]
+                p_y = [pt[1] for pt in pts]
+                fig.add_trace(go.Scatter(x=[p_x[0], p_x[1], p_x[2], p_x[3], p_x[4], p_x[2], p_x[0]], 
+                                         y=[p_y[0], p_y[1], p_y[2], p_y[3], p_y[4], p_y[2], p_y[0]], 
+                                         fill="toself", fillcolor='rgba(59, 130, 246, 0.15)', 
+                                         line=dict(color='#3b82f6', width=2), name=p.get('name')), row=1, col=1)
+
+    if show_ichimoku:
+        fig.add_trace(go.Scatter(x=df.index, y=df['tenkan'], line=dict(color='blue', width=1), name='Tenkan'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['kijun'], line=dict(color='red', width=1), name='Kijun'), row=1, col=1)
+
+    if show_fibs and "fib_levels" in plan:
+        for name, price in plan["fib_levels"].items():
+            fig.add_hline(y=price, line_dash="dot", line_color="gray", annotation_text=name, row=1, col=1)
+
+    curr_row = 2
+    if "RSI" in osc_selection and 'rsi' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['rsi'], line=dict(color='#9333ea'), name="RSI"), row=curr_row, col=1)
+        curr_row += 1
+    if "MACD" in osc_selection and 'macd' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['macd'], line=dict(color='#3b82f6'), name="MACD"), row=curr_row, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['macds'], line=dict(color='#facc15'), name="Signal"), row=curr_row, col=1)
+        fig.add_trace(go.Bar(x=df.index, y=df['macdh'], marker_color='rgba(128,128,128,0.5)', name="Histogram"), row=curr_row, col=1)
+        curr_row += 1
+    if "Volume" in osc_selection:
+        fig.add_trace(go.Bar(x=df.index, y=df['volume'], name="Volume", marker_color='gray'), row=curr_row, col=1)
+
+    fig.update_layout(template="plotly_dark", height=850, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig, width='stretch')
+
+# 3. SIDEBAR NAVIGATION
+with st.sidebar:
+    st.title("OpenBB Workplace")
+    selected_symbol = st_searchbox(get_symbol_suggestions, label="Search Ticker", key="global_search")
+    symbol = selected_symbol if selected_symbol else "BTC-USD"
+    
+    # RESTORED: Intraday Timeframes
+    tf_display = st.selectbox("Timeframe", ["1h", "4h", "Daily", "Weekly", "Monthly"], index=2)
+    tf_map = {"1h": "1h", "4h": "4h", "Daily": "1d", "Weekly": "1wk", "Monthly": "1mo"}
+    
+    st.divider()
+    page_view = st.radio("Workplace Page", ["Market Analysis", "Advanced Theory", "Copilot Agent"])
+    
+    # RESTORED: Oscillator controls
+    osc_selection = st.multiselect("Active Indicators", ["RSI", "MACD", "Volume"], default=["RSI", "MACD", "Volume"])
+    
+    execute_analysis = st.button("🚀 Sync Market Data", width='stretch')
+
+# 4. DATA ENGINE
+@st.cache_data(ttl=300)
+def cached_pipeline(sym, tf):
+    return run_pipeline(symbol=sym, timeframe=tf)
+
+results = cached_pipeline(symbol, tf_map[tf_display]) if (execute_analysis or selected_symbol) else {}
+
+# 5. WORKPLACE ROUTING
+if results and results.get("success"):
+    full_df = results["data"][tf_map[tf_display]]
+    plan = results.get("action_plan", {})
+    
+    if page_view == "Market Analysis":
+        col_m, col_s = st.columns([3, 1])
+        with col_m:
+            st.subheader(f"Dashboard: {symbol}")
+            render_tv_chart(full_df, plan)
+        with col_s:
+            st.metric("Regime", plan.get('bias', 'NEUTRAL'))
+            st.metric("Price", f"{full_df['close'].iloc[-1]:.2f}")
+            st.write("**Active Signals**")
+            st.info(results.get("signal", {}).get("signal", "HOLD"))
+
+    elif page_view == "Advanced Theory":
+        st.subheader("Elliott Wave & Harmonic Projections")
+        patterns = [p.get("name") for p in plan.get("harmonics", [])]
+        active = st.multiselect("Active Patterns", patterns, default=patterns)
+        
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            # Passes user oscillator selection directly to the drawing engine
+            render_advanced_theory_chart(full_df, plan, active, True, True, osc_selection)
+        with col2:
+            st.write("**Elliott Waves**")
+            st.caption(plan.get("elliott", {}).get("label", "Calculating..."))
+
+    elif page_view == "Copilot Agent":
+        st.subheader("Copilot Research Workplace")
+        if "chat_history" not in st.session_state: st.session_state.chat_history = []
+        
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]): st.write(msg["content"])
+            
+        if prompt := st.chat_input("Ask about wave targets or the PRZ..."):
+            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            with st.chat_message("user"): st.write(prompt)
+            
+            # Sophisticated AI Context Injection
+            context = f"Analyzing {symbol}. Bias is {plan.get('bias')}. "
+            if plan.get('harmonics'): context += f"Pattern detected: {plan['harmonics'][0]['name']}. "
+            
+            with st.chat_message("assistant"):
+                res = f"Based on the {tf_display} structure, {context}. The reversal zone is localized at {full_df['close'].iloc[-1]:.2f}. Targets are defined by the current Elliott Wave expansion."
+                st.write(res)
+                st.session_state.chat_history.append({"role": "assistant", "content": res})
+
+else:
+    st.info("👋 Welcome to OpenBB Workplace. Search a ticker in the sidebar to initialize the AI Engine.")"""Root configuration for pytest."""
+
+# flake8: noqa: S101
+# pylint: disable=unused-argument,unused-import
+
+import os
+from pathlib import Path
+
+import pytest  # noqa: F401
+
+ROOT_DIR = Path(__file__).parent
+
+
+def pytest_configure():
+    """Set environment variables for testing."""
+    os.environ["OPENBB_AUTO_BUILD"] = "true"
+
+
+def pytest_collection_modifyitems(config, items):
+    """Modify test collection to ensure cleanup-dependent tests run first."""
+    # Find tests that should run early (checking clean state)
+    early_tests: list = []
+    other_tests: list = []
+
+    for item in items:
+        # Tests that check repository state should run first
+        if (
+            "repository_state" in item.name.lower()
+            or "extension_map" in item.name.lower()
+            or "test_logging_service" in item.name.lower()
+            or item.get_closest_marker("order")
+        ):
+            early_tests.append(item)
+        else:
+            other_tests.append(item)
+
+    # Sort early tests by their order marker if present
+    early_tests.sort(
+        key=lambda x: (
+            getattr(x.get_closest_marker("order"), "args", [999])[0]
+            if x.get_closest_marker("order")
+            else 999
+        )
+    )
+
+    # Reorder: early tests first, then others
+    items[:] = early_tests + other_tests
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import plotly.express as px
+
+st.set_page_config(layout="wide")
+
+st.title("📈 OpenBB Stock Analysis Dashboard")
+st.subheader("Analyze multiple stocks locally using OpenBB-style data")
+
+# --- SIDEBAR ---
+st.sidebar.header("Settings")
+
+tickers_input = st.sidebar.text_input(
+    "Enter stock tickers (comma-separated)",
+    value="AAPL,MSFT,NVDA"
+)
+
+start_date = st.sidebar.date_input("Start date", pd.to_datetime("2023-01-01"))
+end_date = st.sidebar.date_input("End date", pd.to_datetime("today"))
+
+run = st.sidebar.button("Run Analysis")
+
+# --- MAIN LOGIC ---
+if run:
+    tickers = [t.strip().upper() for t in tickers_input.split(",")]
+
+    prices = yf.download(
+        tickers,
+        start=start_date,
+        end=end_date,
+        auto_adjust=True
+    )["Close"]
+
+    st.subheader("📊 Price Data")
+    st.dataframe(prices.tail())
+
+    # Normalize prices
+    normalized = prices / prices.iloc[0] * 100
+
+    st.subheader("📈 Normalized Performance (Start = 100)")
+    fig = px.line(
+        normalized,
+        labels={"value": "Normalized Price", "index": "Date"},
+        title="Stock Performance Comparison"
+    )
+    st.plotly_chart(fig, width="stretch")
+
+    # Returns table
+    returns = ((prices.iloc[-1] / prices.iloc[0]) - 1) * 100
+    returns_df = returns.to_frame(name="Total Return (%)").round(2)
+
+    st.subheader("📌 Total Returns")
+    st.table(returns_df)
+"""Install for development script."""
+
+# flake8: noqa: S603
+
+import subprocess
+import sys
+from pathlib import Path
+
+from tomlkit import dumps, load, loads
+
+PLATFORM_PATH = Path(__file__).parent.resolve()
+LOCK = PLATFORM_PATH / "poetry.lock"
+PYPROJECT = PLATFORM_PATH / "pyproject.toml"
+CLI_PATH = Path(__file__).parent.parent.resolve() / "cli"
+CLI_PYPROJECT = CLI_PATH / "pyproject.toml"
+CLI_LOCK = CLI_PATH / "poetry.lock"
+
+LOCAL_DEPS = """
+[tool.poetry.dependencies]
+python = ">=3.10,<3.14"
+openbb-devtools = { path = "./extensions/devtools", develop = true, markers = "python_version >= '3.10'" }
+openbb-core = { path = "./core", develop = true }
+openbb-platform-api = { path = "./extensions/platform_api", develop = true }
+
+openbb-benzinga = { path = "./providers/benzinga", develop = true }
+openbb-bls = { path = "./providers/bls", develop = true }
+openbb-cftc = { path = "./providers/cftc", develop = true }
+openbb-congress-gov = { path = "./providers/congress_gov", develop = true }
+openbb-econdb = { path = "./providers/econdb", develop = true }
+openbb-federal-reserve = { path = "./providers/federal_reserve", develop = true }
+openbb-fmp = { path = "./providers/fmp", develop = true }
+openbb-fred = { path = "./providers/fred", develop = true }
+openbb-government-us = { path = "./providers/government_us", develop = true }
+openbb-imf = { path = "./providers/imf", develop = true }
+openbb-intrinio = { path = "./providers/intrinio", develop = true }
+openbb-oecd = { path = "./providers/oecd", develop = true }
+openbb-polygon = { path = "./providers/polygon", develop = true }
+openbb-sec = { path = "./providers/sec", develop = true }
+openbb-tiingo = { path = "./providers/tiingo", develop = true }
+openbb-tradingeconomics = { path = "./providers/tradingeconomics", develop = true }
+openbb-us-eia = { path = "./providers/eia", develop = true }
+openbb-yfinance = { path = "./providers/yfinance", develop = true }
+
+openbb-commodity = { path = "./extensions/commodity", develop = true }
+openbb-crypto = { path = "./extensions/crypto", develop = true }
+openbb-currency = { path = "./extensions/currency", develop = true }
+openbb-derivatives = { path = "./extensions/derivatives", develop = true }
+openbb-economy = { path = "./extensions/economy", develop = true }
+openbb-equity = { path = "./extensions/equity", develop = true }
+openbb-etf = { path = "./extensions/etf", develop = true }
+openbb-fixedincome = { path = "./extensions/fixedincome", develop = true }
+openbb-index = { path = "./extensions/index", develop = true }
+openbb-news = { path = "./extensions/news", develop = true }
+openbb-regulators = { path = "./extensions/regulators", develop = true }
+openbb-mcp-server = { path = "./extensions/mcp_server", develop = true, markers = "python_version >= '3.10'" }
+
+# Community dependencies
+openbb-alpha-vantage = { path = "./providers/alpha_vantage", optional = true, develop = true }
+openbb-biztoc = { path = "./providers/biztoc", optional = true, develop = true }
+openbb-cboe = { path = "./providers/cboe", optional = true, develop = true }
+openbb-deribit = { path = "./providers/deribit", optional = true, develop = true }
+openbb-ecb = { path = "./providers/ecb", optional = true, develop = true }
+openbb-famafrench = { path = "./providers/famafrench", optional = true, develop = true }
+openbb-finra = { path = "./providers/finra", optional = true, develop = true }
+openbb-finviz = { path = "./providers/finviz", optional = true, develop = true }
+openbb-multpl = { path = "./providers/multpl", optional = true, develop = true }
+openbb-nasdaq = { path = "./providers/nasdaq", optional = true, develop = true }
+openbb-seeking-alpha = { path = "./providers/seeking_alpha", optional = true, develop = true }
+openbb-stockgrid = { path = "./providers/stockgrid" , optional = true,  develop = true }
+openbb_tmx = { path = "./providers/tmx", optional = true, develop = true }
+openbb_tradier = { path = "./providers/tradier", optional = true, develop = true }
+openbb-wsj = { path = "./providers/wsj", optional = true, develop = true }
+
+openbb-charting = { path = "./obbject_extensions/charting", optional = true, develop = true }
+openbb-econometrics = { path = "./extensions/econometrics", optional = true, develop = true }
+openbb-quantitative = { path = "./extensions/quantitative", optional = true, develop = true }
+openbb-technical = { path = "./extensions/technical", optional = true, develop = true }
+"""
+
+
+def extract_dependencies(local_dep_path, dev: bool = False):
+    """Extract development dependencies from a given package's pyproject.toml."""
+    package_pyproject_path = PLATFORM_PATH / local_dep_path
+    if package_pyproject_path.exists():
+        with open(package_pyproject_path / "pyproject.toml") as f:
+            package_pyproject_toml = load(f)
+        if dev:
+            return (
+                package_pyproject_toml.get("tool", {})
+                .get("poetry", {})
+                .get("group", {})
+                .get("dev", {})
+                .get("dependencies", {})
+            )
+        return (
+            package_pyproject_toml.get("tool", {})
+            .get("poetry", {})
+            .get("dependencies", {})
+        )
+    return {}
+
+
+def get_all_dev_dependencies():
+    """Aggregate development dependencies from all local packages."""
+    all_dev_dependencies = {}
+    local_deps = loads(LOCAL_DEPS).get("tool", {}).get("poetry", {})["dependencies"]
+    for _, package_info in local_deps.items():
+        if "path" in package_info:
+            dev_deps = extract_dependencies(Path(package_info["path"]), dev=True)
+            all_dev_dependencies.update(dev_deps)
+    return all_dev_dependencies
+
+
+def install_platform_local(_extras: bool = False):
+    """Install the Platform locally for development purposes."""
+    original_lock = LOCK.read_text(encoding="utf-8")
+    original_pyproject = PYPROJECT.read_text(encoding="utf-8")
+
+    local_deps = loads(LOCAL_DEPS).get("tool", {}).get("poetry", {})["dependencies"]
+    with open(PYPROJECT) as f:
+        pyproject_toml = load(f)
+    pyproject_toml.get("tool", {}).get("poetry", {}).get("dependencies", {}).update(
+        local_deps
+    )
+
+    if _extras:
+        dev_dependencies = get_all_dev_dependencies()
+        pyproject_toml.get("tool", {}).get("poetry", {}).setdefault(
+            "group", {}
+        ).setdefault("dev", {}).setdefault("dependencies", {})
+        pyproject_toml.get("tool", {}).get("poetry", {})["group"]["dev"][
+            "dependencies"
+        ].update(dev_dependencies)
+
+    TEMP_PYPROJECT = dumps(pyproject_toml)
+
+    try:
+        with open(PYPROJECT, "w", encoding="utf-8", newline="\n") as f:
+            f.write(TEMP_PYPROJECT)
+
+        CMD = [sys.executable, "-m", "poetry"]
+        extras_args = ["-E", "all"] if _extras else []
+
+        subprocess.run(
+            CMD + ["lock", "--regenerate"],
+            cwd=PLATFORM_PATH,
+            check=True,
+        )
+        subprocess.run(
+            CMD + ["install"] + extras_args,
+            cwd=PLATFORM_PATH,
+            check=True,
+        )
+
+    except (Exception, KeyboardInterrupt) as e:
+        print(e)  # noqa: T201
+        print("Restoring pyproject.toml and poetry.lock")  # noqa: T201
+
+    finally:
+        # Revert pyproject.toml and poetry.lock to their original state.
+        with open(PYPROJECT, "w", encoding="utf-8", newline="\n") as f:
+            f.write(original_pyproject)
+
+        with open(LOCK, "w", encoding="utf-8", newline="\n") as f:
+            f.write(original_lock)
+
+
+def install_platform_cli():
+    """Install the CLI locally for development purposes."""
+    original_lock = CLI_LOCK.read_text(encoding="utf-8")
+    original_pyproject = CLI_PYPROJECT.read_text(encoding="utf-8")
+
+    with open(CLI_PYPROJECT) as f:
+        pyproject_toml = load(f)
+
+    # remove "openbb" from dependencies
+    pyproject_toml.get("tool", {}).get("poetry", {}).get("dependencies", {}).pop(
+        "openbb", None
+    )
+
+    TEMP_PYPROJECT = dumps(pyproject_toml)
+
+    try:
+        with open(CLI_PYPROJECT, "w", encoding="utf-8", newline="\n") as f:
+            f.write(TEMP_PYPROJECT)
+
+        CMD = [sys.executable, "-m", "poetry"]
+
+        subprocess.run(
+            CMD + ["lock", "--regenerate"],
+            cwd=CLI_PATH,
+            check=True,  # noqa: S603
+        )
+        subprocess.run(CMD + ["install"], cwd=CLI_PATH, check=True)  # noqa: S603
+
+    except (Exception, KeyboardInterrupt) as e:
+        print(e)  # noqa: T201
+        print("Restoring pyproject.toml and poetry.lock")  # noqa: T201
+
+    finally:
+        # Revert pyproject.toml and poetry.lock to their original state.
+        with open(CLI_PYPROJECT, "w", encoding="utf-8", newline="\n") as f:
+            f.write(original_pyproject)
+
+        with open(CLI_LOCK, "w", encoding="utf-8", newline="\n") as f:
+            f.write(original_lock)
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    extras = any(arg.lower() in ["-e", "--extras"] for arg in args)
+    cli = any(arg.lower() in ["-c", "--cli"] for arg in args)
+    install_platform_local(extras)
+    if cli:
+        install_platform_cli()
+from openbb import obb
+
+data = obb.equity.price.historical("AAPL")
+
+df = data.to_dataframe()
+print(df.head())

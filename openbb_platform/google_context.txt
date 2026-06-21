@@ -1,0 +1,358 @@
+[tool.poetry]
+name = "openbb"
+version = "4.6.0"
+description = "Investment research for everyone, anywhere."
+authors = ["OpenBB Team <hello@openbb.co>"]
+license = "AGPL-3.0-only"
+readme = "README.md"
+
+packages = [{ include = "openbb", from = "core" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.14"
+openbb-core = "^1.5.8"
+openbb-platform-api = "^1.2.3"
+
+openbb-benzinga = "^1.5.1"
+openbb-bls = "^1.2.1"
+openbb-cftc = "^1.2.1"
+openbb-congress-gov = "^1.1.1"
+openbb-econdb = "^1.4.1"
+openbb-federal-reserve = "^1.5.1"
+openbb-fmp = "^1.5.2"
+openbb-fred = "^1.5.1"
+openbb-government-us = "^1.5.2"
+openbb-imf = "^2.0.0"
+openbb-intrinio = "^1.5.1"
+openbb-oecd = "^1.5.1"
+openbb-polygon = "^1.5.1"
+openbb-sec = "^1.5.1"
+openbb-tiingo = "^1.5.1"
+openbb-tradingeconomics = "^1.5.1"
+openbb-us-eia = "^1.2.1"
+openbb-yfinance = "^1.5.2"
+
+openbb-commodity = "^1.4.2"
+openbb-crypto = "^1.5.1"
+openbb-currency = "^1.5.1"
+openbb-derivatives = "^1.5.1"
+openbb-economy = "^1.5.1"
+openbb-equity = "^1.5.1"
+openbb-etf = "^1.5.1"
+openbb-fixedincome = "^1.5.1"
+openbb-index = "^1.5.1"
+openbb-news = "^1.5.1"
+openbb-regulators = "^1.5.1"
+
+# Community dependencies
+openbb-alpha-vantage = { version = "^1.5.1", optional = true }
+openbb-biztoc = { version = "^1.5.1", optional = true }
+openbb-cboe = { version = "^1.5.1", optional = true }
+openbb-deribit = { version = "^1.1.1", optional = true }
+openbb-ecb = { version = "^1.5.1", optional = true }
+openbb-famafrench = { version = "^1.1.1", optional = true }
+openbb-finra = { version = "^1.5.1", optional = true }
+openbb-finviz = { version = "^1.4.1", optional = true }
+openbb-multpl = { version = "^1.2.1", optional = true }
+openbb-nasdaq = { version = "^1.5.1", optional = true }
+openbb-seeking-alpha = { version = "^1.5.1", optional = true }
+openbb-stockgrid = { version = "^1.5.1", optional = true }
+openbb-tmx = { version = "^1.4.1", optional = true }
+openbb-tradier = { version = "^1.4.1", optional = true }
+openbb-wsj = { version = "^1.5.1", optional = true }
+
+openbb-charting = { version = "^2.4.1", optional = true }
+openbb-econometrics = { version = "^1.6.1", optional = true }
+openbb-quantitative = { version = "^1.5.1", optional = true }
+openbb-technical = { version = "^1.5.1", optional = true }
+openbb-mcp-server = { version = "^1.2.2", optional = true }
+
+[tool.poetry.extras]
+alpha_vantage = ["openbb-alpha-vantage"]
+biztoc = ["openbb-biztoc"]
+cboe = ["openbb-cboe"]
+charting = ["openbb-charting"]
+deribit = ["openbb-deribit"]
+ecb = ["openbb-ecb"]
+econometrics = ["openbb-econometrics"]
+famafrench = ["openbb-famafrench"]
+finra = ["openbb-finra"]
+finviz = ["openbb-finviz"]
+mcp_server = ["openbb-mcp-server"]
+nasdaq = ["openbb-nasdaq"]
+multpl = ["openbb-multpl"]
+quantitative = ["openbb-quantitative"]
+seeking_alpha = ["openbb-seeking-alpha"]
+stockgrid = ["openbb-stockgrid"]
+technical = ["openbb-technical"]
+tmx = ["openbb-tmx"]
+tradier = ["openbb-tradier"]
+wsj = ["openbb-wsj"]
+
+
+all = [
+    "openbb-alpha-vantage",
+    "openbb-biztoc",
+    "openbb-cboe",
+    "openbb-charting",
+    "openbb-deribit",
+    "openbb-ecb",
+    "openbb-econometrics",
+    "openbb-famafrench",
+    "openbb-finra",
+    "openbb-finviz",
+    "openbb-mcp-server",
+    "openbb-multpl",
+    "openbb-nasdaq",
+    "openbb-quantitative",
+    "openbb-seeking-alpha",
+    "openbb-stockgrid",
+    "openbb-technical",
+    "openbb-tmx",
+    "openbb-tradier",
+    "openbb-wsj",
+]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+# --- Core Platform ---
+openbb>=4.1.0
+openbb-yfinance>=4.1.0
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# --- UI & Charting ---
+streamlit>=1.30.0
+streamlit-searchbox>=0.1.0
+streamlit-lightweight-charts>=0.1.3
+pytickersymbols>=1.17.0
+plotly>=5.18.0
+
+# --- Data Providers & Fallbacks ---
+yfinance>=0.2.35
+tfinance>=0.1.0
+tsetmc>=0.4.5
+requests>=2.31.0
+
+# --- Technical Analysis & Models ---
+pandas-ta>=0.3.14b
+scikit-learn>=1.3.0
+pyharmonics>=0.1.0from openbb import obb
+
+# Pull historical price data
+data = obb.equity.price.historical("AAPL")
+
+# Convert to pandas DataFrame
+df = data.to_dataframe()
+
+# Basic analysis
+print("\n=== LAST 5 DAYS ===")
+print(df.tail())
+
+print("\n=== SUMMARY ===")
+print(df.describe())
+
+print("\n=== RETURNS (%) ===")
+returns = df["close"].pct_change() * 100
+print(returns.tail())
+# app.py
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from streamlit_searchbox import st_searchbox
+from streamlit_lightweight_charts import renderLightweightCharts 
+
+# Architecture Imports
+from engine.search import get_symbol_suggestions
+from engine.pipeline import run_pipeline
+
+# 1. PRIMARY CONFIGURATION
+st.set_page_config(page_title="OpenBB Workplace AI", layout="wide", initial_sidebar_state="expanded")
+
+# 2026 CSS Styling for High-Quality Workplace
+st.markdown("""
+    <style>
+    .stApp { background-color: #0B0E14; }
+    [data-testid="stMetricValue"] { font-size: 1.4rem; color: #3b82f6; }
+    .stTabs [data-baseweb="tab-list"] { gap: 10px; }
+    .stTabs [data-baseweb="tab"] { 
+        height: 50px; background-color: #161B22; 
+        border-radius: 4px; padding: 10px 25px; color: #848E9C;
+    }
+    .stTabs [aria-selected="true"] { background-color: #1f2937; border-bottom: 2px solid #3b82f6; color: white; }
+    </style>
+""", unsafe_allow_html=True)
+
+# 2. HELPER FUNCTIONS
+def ensure_datetime_index(df: pd.DataFrame):
+    if df is None or df.empty: return df
+    df = df.copy()
+    if not isinstance(df.index, pd.DatetimeIndex): 
+        df.index = pd.to_datetime(df.index)
+    return df
+
+def render_tv_chart(df: pd.DataFrame, plan: dict):
+    """TradingView Lightweight Chart Implementation for Pro-Level Dashboard."""
+    chart_data = df.reset_index()
+    chart_data.columns = [c.lower() for c in chart_data.columns]
+    if 'date' in chart_data.columns: chart_data = chart_data.rename(columns={'date': 'time'})
+    elif 'index' in chart_data.columns: chart_data = chart_data.rename(columns={'index': 'time'})
+    chart_data['time'] = chart_data['time'].astype(str)
+    
+    candles = chart_data[['time', 'open', 'high', 'low', 'close']].to_dict('records')
+    volume = chart_data[['time', 'volume']].rename(columns={'volume': 'value'}).to_dict('records')
+    
+    chart_options = {
+        "height": 600,
+        "layout": {"background": {"type": 'solid', "color": '#0B0E14'}, "textColor": '#d1d4dc'},
+        "grid": {"vertLines": {"color": '#1f2937'}, "horzLines": {"color": '#1f2937'}},
+        "priceScale": {"borderColor": '#2b2b43'},
+        "timeScale": {"borderColor": '#2b2b43'}
+    }
+    
+    series = [
+        {"type": 'Candlestick', "data": candles, "options": {"upColor": '#26a69a', "downColor": '#ef5350'}},
+        {"type": 'Histogram', "data": volume, "options": {"color": 'rgba(38, 166, 154, 0.3)', "priceFormat": {"type": 'volume'}, "priceScaleId": ""}}
+    ]
+    renderLightweightCharts(charts=[{"chart": chart_options, "series": series}])
+
+def render_advanced_theory_chart(df: pd.DataFrame, plan: dict, active_patterns: list, show_ichimoku: bool, show_fibs: bool, osc_selection: list):
+    """High-Fidelity Plotly Chart for Geometric Analysis (Elliott & Harmonics)."""
+    df = ensure_datetime_index(df)
+    
+    if show_ichimoku:
+        df['tenkan'] = (df['high'].rolling(9).max() + df['low'].rolling(9).min()) / 2
+        df['kijun'] = (df['high'].rolling(26).max() + df['low'].rolling(26).min()) / 2
+
+    rows = 1 + len(osc_selection)
+    row_heights = [0.7] + [0.3 / len(osc_selection)] * len(osc_selection) if osc_selection else [1.0]
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.02, row_heights=row_heights)
+    
+    # Candlestick
+    fig.add_trace(go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'], name="Price"), row=1, col=1)
+
+    # Elliott Wave (High-Fidelity Drawing)
+    elliott = plan.get("elliott", {})
+    if "wave_coords" in elliott:
+        coords = elliott["wave_coords"]
+        fig.add_trace(go.Scatter(
+            x=[c['x'] for c in coords], y=[c['y'] for c in coords],
+            mode='lines+markers+text', text=["1", "2", "3"], textposition="top center",
+            line=dict(color='#facc15', width=3, dash='dash'), name="Elliott Path"
+        ), row=1, col=1)
+
+    # Harmonics
+    for p in plan.get("harmonics", []):
+        if p.get('name') in active_patterns:
+            pts = p.get('points', [])
+            if len(pts) >= 5:
+                p_x = [df.index[min(int(pt[0]), len(df)-1)] for pt in pts]
+                p_y = [pt[1] for pt in pts]
+                fig.add_trace(go.Scatter(x=[p_x[0], p_x[1], p_x[2], p_x[3], p_x[4], p_x[2], p_x[0]], 
+                                         y=[p_y[0], p_y[1], p_y[2], p_y[3], p_y[4], p_y[2], p_y[0]], 
+                                         fill="toself", fillcolor='rgba(59, 130, 246, 0.15)', 
+                                         line=dict(color='#3b82f6', width=2), name=p.get('name')), row=1, col=1)
+
+    if show_ichimoku:
+        fig.add_trace(go.Scatter(x=df.index, y=df['tenkan'], line=dict(color='blue', width=1), name='Tenkan'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['kijun'], line=dict(color='red', width=1), name='Kijun'), row=1, col=1)
+
+    if show_fibs and "fib_levels" in plan:
+        for name, price in plan["fib_levels"].items():
+            fig.add_hline(y=price, line_dash="dot", line_color="gray", annotation_text=name, row=1, col=1)
+
+    curr_row = 2
+    if "RSI" in osc_selection and 'rsi' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['rsi'], line=dict(color='#9333ea'), name="RSI"), row=curr_row, col=1)
+        curr_row += 1
+    if "MACD" in osc_selection and 'macd' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['macd'], line=dict(color='#3b82f6'), name="MACD"), row=curr_row, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['macds'], line=dict(color='#facc15'), name="Signal"), row=curr_row, col=1)
+        fig.add_trace(go.Bar(x=df.index, y=df['macdh'], marker_color='rgba(128,128,128,0.5)', name="Histogram"), row=curr_row, col=1)
+        curr_row += 1
+    if "Volume" in osc_selection:
+        fig.add_trace(go.Bar(x=df.index, y=df['volume'], name="Volume", marker_color='gray'), row=curr_row, col=1)
+
+    fig.update_layout(template="plotly_dark", height=850, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=10, b=10))
+    st.plotly_chart(fig, width='stretch')
+
+# 3. SIDEBAR NAVIGATION
+with st.sidebar:
+    st.title("OpenBB Workplace")
+    selected_symbol = st_searchbox(get_symbol_suggestions, label="Search Ticker", key="global_search")
+    symbol = selected_symbol if selected_symbol else "BTC-USD"
+    
+    # RESTORED: Intraday Timeframes
+    tf_display = st.selectbox("Timeframe", ["1h", "4h", "Daily", "Weekly", "Monthly"], index=2)
+    tf_map = {"1h": "1h", "4h": "4h", "Daily": "1d", "Weekly": "1wk", "Monthly": "1mo"}
+    
+    st.divider()
+    page_view = st.radio("Workplace Page", ["Market Analysis", "Advanced Theory", "Copilot Agent"])
+    
+    # RESTORED: Oscillator controls
+    osc_selection = st.multiselect("Active Indicators", ["RSI", "MACD", "Volume"], default=["RSI", "MACD", "Volume"])
+    
+    execute_analysis = st.button("🚀 Sync Market Data", width='stretch')
+
+# 4. DATA ENGINE
+@st.cache_data(ttl=300)
+def cached_pipeline(sym, tf):
+    return run_pipeline(symbol=sym, timeframe=tf)
+
+results = cached_pipeline(symbol, tf_map[tf_display]) if (execute_analysis or selected_symbol) else {}
+
+# 5. WORKPLACE ROUTING
+if results and results.get("success"):
+    full_df = results["data"][tf_map[tf_display]]
+    plan = results.get("action_plan", {})
+    
+    if page_view == "Market Analysis":
+        col_m, col_s = st.columns([3, 1])
+        with col_m:
+            st.subheader(f"Dashboard: {symbol}")
+            render_tv_chart(full_df, plan)
+        with col_s:
+            st.metric("Regime", plan.get('bias', 'NEUTRAL'))
+            st.metric("Price", f"{full_df['close'].iloc[-1]:.2f}")
+            st.write("**Active Signals**")
+            st.info(results.get("signal", {}).get("signal", "HOLD"))
+
+    elif page_view == "Advanced Theory":
+        st.subheader("Elliott Wave & Harmonic Projections")
+        patterns = [p.get("name") for p in plan.get("harmonics", [])]
+        active = st.multiselect("Active Patterns", patterns, default=patterns)
+        
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            # Passes user oscillator selection directly to the drawing engine
+            render_advanced_theory_chart(full_df, plan, active, True, True, osc_selection)
+        with col2:
+            st.write("**Elliott Waves**")
+            st.caption(plan.get("elliott", {}).get("label", "Calculating..."))
+
+    elif page_view == "Copilot Agent":
+        st.subheader("Copilot Research Workplace")
+        if "chat_history" not in st.session_state: st.session_state.chat_history = []
+        
+        for msg in st.session_state.chat_history:
+            with st.chat_message(msg["role"]): st.write(msg["content"])
+            
+        if prompt := st.chat_input("Ask about wave targets or the PRZ..."):
+            st.session_state.chat_history.append({"role": "user", "content": prompt})
+            with st.chat_message("user"): st.write(prompt)
+            
+            # Sophisticated AI Context Injection
+            context = f"Analyzing {symbol}. Bias is {plan.get('bias')}. "
+            if plan.get('harmonics'): context += f"Pattern detected: {plan['harmonics'][0]['name']}. "
+            
+            with st.chat_message("assistant"):
+                res = f"Based on the {tf_display} structure, {context}. The reversal zone is localized at {full_df['close'].iloc[-1]:.2f}. Targets are defined by the current Elliott Wave expansion."
+                st.write(res)
+                st.session_state.chat_history.append({"role": "assistant", "content": res})
+
+else:
+    st.info("👋 Welcome to OpenBB Workplace. Search a ticker in the sidebar to initialize the AI Engine.")

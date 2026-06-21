@@ -1,0 +1,24 @@
+# --- Core Platform ---
+openbb>=4.1.0
+openbb-yfinance>=4.1.0
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+
+# --- UI & Charting ---
+streamlit>=1.30.0
+streamlit-searchbox>=0.1.0
+streamlit-lightweight-charts>=0.1.3
+pytickersymbols>=1.17.0
+plotly>=5.18.0
+
+# --- Data Providers & Fallbacks ---
+yfinance>=0.2.35
+tfinance>=0.1.0
+tsetmc>=0.4.5
+requests>=2.31.0
+
+# --- Technical Analysis & Models ---
+pandas-ta>=0.3.14b
+scikit-learn>=1.3.0
+pyharmonics>=0.1.0
