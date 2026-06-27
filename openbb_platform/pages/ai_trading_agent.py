@@ -491,6 +491,44 @@ HARMONIC_RECIP_ABCD: Dict[str, Any] = {
     "PRO_ABC": (1.000, 1.270, 1.618),
 }
 
+# ── Pattern 11: CYPHER ─────────────────────────────────────────────────────
+# Source: Carney *Harmonic Trading* / [CV3]. ADDED [H4].
+# CRITICAL EXCEPTION: C is an EXTENSION of XA (XC/XA), NOT a retracement of AB.
+# B retraces XA (0.382-0.618); D completes at the 0.786 retracement of the XC leg.
+HARMONIC_CYPHER: Dict[str, Any] = {
+    "name": "CYPHER",
+    "source": "[CV3] — Cypher",
+    "B_of_XA": {"lo": 0.382, "hi": 0.618, "tol": 0.02, "formula": "AB_len / XA_len"},
+    "C_of_XA": {"lo": 1.272, "hi": 1.414, "tol": 0.02, "formula": "XC_len / XA_len (EXTENSION)"},
+    "D_of_XC": {"ideal": 0.786, "tol": 0.024, "formula": "CD_len / XC_len"},
+}
+
+# ── Pattern 12: 5-0 ────────────────────────────────────────────────────────
+# Source: Carney *Harmonic Trading Vol.2* / [CV3]. ADDED [H4].
+# Reciprocal: AB is a large leg of XA (1.13-1.618); BC extends AB (1.618-2.24);
+# D completes at the 0.50 retracement of BC (the defining 5-0 ratio).
+HARMONIC_FIVE_ZERO: Dict[str, Any] = {
+    "name": "FIVE_ZERO",
+    "source": "[CV3] — 5-0",
+    "AB_of_XA": {"lo": 1.130, "hi": 1.618, "tol": 0.02, "formula": "AB_len / XA_len"},
+    "BC_of_AB": {"lo": 1.618, "hi": 2.240, "tol": 0.02, "formula": "BC_len / AB_len"},
+    "D_of_BC":  {"ideal": 0.500, "tol": 0.020, "formula": "CD_len / BC_len"},
+}
+
+# ── Pattern 13: THREE DRIVES ───────────────────────────────────────────────
+# Source: Carney / [CV3]. ADDED [H4].
+# Three symmetric drives separated by two pullbacks. Pullbacks retrace 0.618-0.786
+# of the prior drive; each drive extends 1.13-1.618 of the prior pullback; the three
+# drives are roughly equal (symmetry). Completes AT drive 3 — a REAL pivot, not a
+# projection — so its D is inherently present in the detection window.
+HARMONIC_THREE_DRIVES: Dict[str, Any] = {
+    "name": "THREE_DRIVES",
+    "source": "[CV3] — Three Drives",
+    "pullback":  {"lo": 0.618, "hi": 0.786, "tol": 0.03},
+    "drive_ext": {"lo": 1.130, "hi": 1.618, "tol": 0.03},
+    "symmetry_tol": 0.30,   # drives 2 & 3 within ±30% of drive 1 length
+}
+
 # Master list of the 8 XABCD patterns (used by shared detector)
 XABCD_PATTERNS: Tuple[Dict[str, Any], ...] = (
     HARMONIC_GARTLEY,
@@ -1608,15 +1646,181 @@ def detect_reciprocal_abcd(swings: List[Tuple[int, float]]) -> HarmonicResult:
     }
 
 
+def _empty_harm(name: str) -> HarmonicResult:   # <- ADDED [H4]: shared not-found shape
+    return {
+        "pattern": name, "found": False, "quality": "NONE",
+        "worst_dev": float("inf"), "conf_pts": 0,
+        "prz_low": 0.0, "prz_high": 0.0, "d_price": 0.0, "ratios": {},
+    }
+
+
+def _band_dev(r: float, lo: float, hi: float) -> float:   # <- ADDED [H4]: range-aware deviation
+    if (lo - 1e-9) <= r <= (hi + 1e-9):
+        return 0.0
+    return min(abs(r - lo), abs(r - hi))
+
+
+def detect_cypher(swings: List[Tuple[int, float]]) -> HarmonicResult:
+    """
+    Detects the CYPHER pattern (X,A,B,C → projected D). ADDED [H4].
+
+    Carney exception: C is an EXTENSION of XA (XC/XA = 1.272–1.414), NOT a
+    retracement of AB. B retraces XA (0.382–0.618). D is projected at the 0.786
+    retracement of the XC leg. Grade is driven only by the MARKET-determined
+    ratios (B, C); D is projected to its ideal (consistent with the H2 fix).
+    """
+    spec = HARMONIC_CYPHER
+    empty = _empty_harm("CYPHER")
+    if len(swings) < 4:
+        return empty
+    x, a, b, c = (p for _, p in swings[-4:])
+    xa = abs(a - x); ab = abs(b - a); xc = abs(c - x)
+    if xa < 1e-10 or ab < 1e-10 or xc < 1e-10:
+        return empty
+
+    r_b = safe_ratio(ab, xa)     # B retraces XA
+    r_c = safe_ratio(xc, xa)     # C EXTENDS XA (the exception)
+    bs, cs = spec["B_of_XA"], spec["C_of_XA"]
+    b_ok = (bs["lo"] - bs["tol"]) <= r_b <= (bs["hi"] + bs["tol"])
+    c_ok = (cs["lo"] - cs["tol"]) <= r_c <= (cs["hi"] + cs["tol"])
+    if not (b_ok and c_ok):
+        return {**empty, "ratios": {"AB_XA": round(r_b, 4), "XC_XA": round(r_c, 4)}}
+
+    d_ideal = spec["D_of_XC"]["ideal"]            # project D: 0.786 retrace of XC
+    d_price = (c - d_ideal * xc) if c > x else (c + d_ideal * xc)
+    r_d = safe_ratio(abs(d_price - c), xc)
+
+    worst = max(_band_dev(r_b, bs["lo"], bs["hi"]), _band_dev(r_c, cs["lo"], cs["hi"]))
+    quality, conf = _quality_from_dev(worst)
+    if quality == "NONE":
+        return {**empty, "ratios": {"AB_XA": round(r_b, 4), "XC_XA": round(r_c, 4)}}
+
+    prz = d_price * 0.005 if d_price > 1e-10 else 0.005
+    return {
+        "pattern": "CYPHER", "found": True, "quality": quality,
+        "worst_dev": round(worst, 4), "conf_pts": conf,
+        "prz_low": round(d_price - prz, 4), "prz_high": round(d_price + prz, 4),
+        "d_price": round(d_price, 4),
+        "direction": "bullish" if d_price < c else "bearish",
+        "ratios": {"AB_XA": round(r_b, 4), "XC_XA": round(r_c, 4), "CD_XC": round(r_d, 4)},
+    }
+
+
+def detect_five_zero(swings: List[Tuple[int, float]]) -> HarmonicResult:
+    """
+    Detects the 5-0 pattern (X,A,B,C → projected D). ADDED [H4].
+
+    AB is a large reciprocal leg of XA (1.13–1.618); BC extends AB (1.618–2.24);
+    D completes at the 0.50 retracement of BC (the defining 5-0 ratio). Grade is
+    driven by the market-determined AB/XA and BC/AB; D is projected (H2-consistent).
+    """
+    spec = HARMONIC_FIVE_ZERO
+    empty = _empty_harm("FIVE_ZERO")
+    if len(swings) < 4:
+        return empty
+    x, a, b, c = (p for _, p in swings[-4:])
+    xa = abs(a - x); ab = abs(b - a); bc = abs(c - b)
+    if xa < 1e-10 or ab < 1e-10 or bc < 1e-10:
+        return empty
+
+    r_ab = safe_ratio(ab, xa)
+    r_bc = safe_ratio(bc, ab)
+    abs_, bcs = spec["AB_of_XA"], spec["BC_of_AB"]
+    ab_ok = (abs_["lo"] - abs_["tol"]) <= r_ab <= (abs_["hi"] + abs_["tol"])
+    bc_ok = (bcs["lo"] - bcs["tol"]) <= r_bc <= (bcs["hi"] + bcs["tol"])
+    if not (ab_ok and bc_ok):
+        return {**empty, "ratios": {"AB_XA": round(r_ab, 4), "BC_AB": round(r_bc, 4)}}
+
+    d_ideal = spec["D_of_BC"]["ideal"]            # project D: 0.50 retrace of BC
+    d_price = (c - d_ideal * bc) if c > b else (c + d_ideal * bc)
+    r_d = safe_ratio(abs(d_price - c), bc)
+
+    worst = max(_band_dev(r_ab, abs_["lo"], abs_["hi"]), _band_dev(r_bc, bcs["lo"], bcs["hi"]))
+    quality, conf = _quality_from_dev(worst)
+    if quality == "NONE":
+        return {**empty, "ratios": {"AB_XA": round(r_ab, 4), "BC_AB": round(r_bc, 4)}}
+
+    prz = d_price * 0.005 if d_price > 1e-10 else 0.005
+    return {
+        "pattern": "FIVE_ZERO", "found": True, "quality": quality,
+        "worst_dev": round(worst, 4), "conf_pts": conf,
+        "prz_low": round(d_price - prz, 4), "prz_high": round(d_price + prz, 4),
+        "d_price": round(d_price, 4),
+        "direction": "bullish" if d_price < c else "bearish",
+        "ratios": {"AB_XA": round(r_ab, 4), "BC_AB": round(r_bc, 4), "CD_BC": round(r_d, 4)},
+    }
+
+
+def detect_three_drives(swings: List[Tuple[int, float]]) -> HarmonicResult:
+    """
+    Detects THREE DRIVES from 6 pivots p0..p5. ADDED [H4].
+
+    Drives D1(p0→p1), D2(p2→p3), D3(p4→p5); pullbacks PB1(p1→p2), PB2(p3→p4).
+    Each pullback retraces 0.618–0.786 of the prior drive; the three drives are
+    in the SAME direction and roughly equal (±symmetry_tol). Unlike the projected
+    XABCD patterns, Three Drives COMPLETES at p5 — a real pivot — so d_price=p5 is
+    the actual completion (not a projection).
+    """
+    spec = HARMONIC_THREE_DRIVES
+    empty = _empty_harm("THREE_DRIVES")
+    if len(swings) < 6:
+        return empty
+    p0, p1, p2, p3, p4, p5 = (p for _, p in swings[-6:])
+    d1 = abs(p1 - p0); pb1 = abs(p2 - p1)
+    d2 = abs(p3 - p2); pb2 = abs(p4 - p3)
+    d3 = abs(p5 - p4)
+    if min(d1, pb1, d2, pb2, d3) < 1e-10:
+        return empty
+
+    # Drives must share direction (a trending three-drives), pullbacks oppose.
+    dir1, dir2, dir3 = (p1 - p0), (p3 - p2), (p5 - p4)
+    if not (dir1 > 0 and dir2 > 0 and dir3 > 0) and not (dir1 < 0 and dir2 < 0 and dir3 < 0):
+        return empty
+
+    r_pb1 = safe_ratio(pb1, d1)
+    r_pb2 = safe_ratio(pb2, d2)
+    pbs = spec["pullback"]
+    pb1_ok = (pbs["lo"] - pbs["tol"]) <= r_pb1 <= (pbs["hi"] + pbs["tol"])
+    pb2_ok = (pbs["lo"] - pbs["tol"]) <= r_pb2 <= (pbs["hi"] + pbs["tol"])
+    # symmetry: drives 2 & 3 within ±symmetry_tol of drive 1
+    sym_ok = (abs(d2 - d1) <= spec["symmetry_tol"] * d1) and (abs(d3 - d1) <= spec["symmetry_tol"] * d1)
+    if not (pb1_ok and pb2_ok and sym_ok):
+        return {**empty, "ratios": {"PB1_D1": round(r_pb1, 4), "PB2_D2": round(r_pb2, 4),
+                                    "D2_D1": round(safe_ratio(d2, d1), 4),
+                                    "D3_D1": round(safe_ratio(d3, d1), 4)}}
+
+    pb_dev  = max(_band_dev(r_pb1, pbs["lo"], pbs["hi"]), _band_dev(r_pb2, pbs["lo"], pbs["hi"]))
+    sym_dev = max(abs(d2 - d1), abs(d3 - d1)) / d1   # 0..symmetry_tol
+    worst   = max(pb_dev, sym_dev)
+    quality, conf = _quality_from_dev(worst)
+    if quality == "NONE":
+        return {**empty, "ratios": {"PB1_D1": round(r_pb1, 4), "PB2_D2": round(r_pb2, 4)}}
+
+    d_price = p5                                       # completion = real pivot
+    prz = d_price * 0.005 if d_price > 1e-10 else 0.005
+    return {
+        "pattern": "THREE_DRIVES", "found": True, "quality": quality,
+        "worst_dev": round(worst, 4), "conf_pts": conf,
+        "prz_low": round(d_price - prz, 4), "prz_high": round(d_price + prz, 4),
+        "d_price": round(d_price, 4),
+        "direction": "bearish" if dir3 > 0 else "bullish",   # up-drives exhaust into a high → sell
+        "ratios": {"PB1_D1": round(r_pb1, 4), "PB2_D2": round(r_pb2, 4),
+                   "D2_D1": round(safe_ratio(d2, d1), 4), "D3_D1": round(safe_ratio(d3, d1), 4)},
+    }
+
+
 def scan_all_harmonic_patterns(swings: List[Tuple[int, float]]) -> List[HarmonicResult]:
     """
-    Scans for all 10 harmonic patterns from the audited Carney reference.
+    Scans for all 13 harmonic patterns from the audited Carney reference.
 
     Patterns 1–8 (XABCD): shared detector, 4-pivot (X,A,B,C) window slid over ALL swings.
-    Pattern 9 (Shark):     dedicated detector using 0XABC labeling.
-    Pattern 10 (Recip):    dedicated detector using BC-based D constraint.
+    Pattern 9 (Shark):       dedicated detector using 0XABC labeling.
+    Pattern 10 (Recip):      dedicated detector using BC-based D constraint.
+    Pattern 11 (Cypher):     C is an EXTENSION of XA (the Carney exception); D=0.786 XC. [H4]
+    Pattern 12 (5-0):        AB reciprocal of XA; D at 0.50 of BC. [H4]
+    Pattern 13 (Three Drives): 6-pivot symmetry, completes at a real pivot. [H4]
 
-    Returns list of 10 HarmonicResult dicts (found or not found per pattern).
+    Returns list of 13 HarmonicResult dicts (found or not found per pattern).
     """
     # FIXED [Council H-SCAN]: previously only the single most-recent pivot window
     # (swings[-5:]) was ever tested, so a textbook pattern completing anywhere but
@@ -1701,6 +1905,27 @@ def scan_all_harmonic_patterns(swings: List[Tuple[int, float]]) -> List[Harmonic
             _confirm(_rc, prices[i + 4] if i + 4 < n else None)       # <- ADDED [H-CONFIRM]
         recip_best = _keep_best(recip_best, _rc)
     results.append(recip_best)
+
+    # Pattern 11 (Cypher) & 12 (5-0): 4-pivot (X,A,B,C) windows, D projected. ADDED [H4].
+    for _det, _nm in ((detect_cypher, "CYPHER"), (detect_five_zero, "FIVE_ZERO")):
+        _best = _empty(_nm)
+        for i in range(0, max(0, n - 3)):
+            _cand = _det(swings[i:i + 4])
+            if _cand.get("found"):
+                _cand["pivot_idx"] = [swings[i + k][0] for k in range(4)]
+                _confirm(_cand, prices[i + 4] if i + 4 < n else None)
+            _best = _keep_best(_best, _cand)
+        results.append(_best)
+
+    # Pattern 13 (Three Drives): 6-pivot window; completes at the real pivot p5. ADDED [H4].
+    td_best = _empty("THREE_DRIVES")
+    for i in range(0, max(0, n - 5)):
+        _td = detect_three_drives(swings[i:i + 6])
+        if _td.get("found"):
+            _td["pivot_idx"] = [swings[i + k][0] for k in range(6)]
+            _confirm(_td, prices[i + 6] if i + 6 < n else None)
+        td_best = _keep_best(td_best, _td)
+    results.append(td_best)
 
     return results
 

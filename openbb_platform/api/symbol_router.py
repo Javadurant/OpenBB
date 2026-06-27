@@ -289,7 +289,7 @@ def technical(symbol: str) -> dict[str, Any]:
             "status":     "ok",
             "symbol":     symbol.upper(),
             "last_price": _round(last_price, 2),
-            "harmonics":  [clean(p) for p in harmonics[:10]],
+            "harmonics":  [clean(p) for p in harmonics[:13]],   # <- [H4]: 10 → 13 (Cypher / 5-0 / Three Drives)
             "elliott":    {**clean(elliott),                       # legacy fields preserved (wave_phase, conf_pts, …)
                            "chart_label": elliott_computed["chart_label"],  # <- NEW: computed label for chart overlay
                            "computed": elliott_computed},          # <- NEW: full computed block (preferred/alternate/pivots)
