@@ -1660,6 +1660,21 @@ def _band_dev(r: float, lo: float, hi: float) -> float:   # <- ADDED [H4]: range
     return min(abs(r - lo), abs(r - hi))
 
 
+def _recency_limit(swings: List[Tuple[int, float]]) -> int:   # <- ADDED [H5]
+    """How old (in bars) a pattern's LAST pivot may be and still count as actionable.
+
+    A daily-timeframe harmonic must be tradeable NOW — not a textbook shape pivoted
+    18 months ago. We gate every found pattern AND the near-miss so its last pivot sits
+    in the recent tail of the series (~the last quarter of the window, floored at 60 bars,
+    a sane daily-swing horizon). If nothing recent qualifies the engine reports NONE,
+    which is the truthful state ("no harmonic found in the recent window").
+    """
+    if not swings:
+        return 10 ** 9
+    total = swings[-1][0] + 1
+    return max(60, int(0.25 * total))
+
+
 def detect_cypher(swings: List[Tuple[int, float]]) -> HarmonicResult:
     """
     Detects the CYPHER pattern (X,A,B,C → projected D). ADDED [H4].
@@ -1927,6 +1942,21 @@ def scan_all_harmonic_patterns(swings: List[Tuple[int, float]]) -> List[Harmonic
         td_best = _keep_best(td_best, _td)
     results.append(td_best)
 
+    # [H5] RECENCY GATE: a pattern is only actionable if its LAST pivot is in the recent
+    # tail of the series. Demote stale founds (e.g. an 18-month-old shape on a daily view)
+    # to not-found so the UI never surfaces them — matching "no harmonic found in 2026 =>
+    # show none". Ratios are preserved + a `stale` flag is set for transparency.
+    if swings:
+        _last    = swings[-1][0]
+        _recency = _recency_limit(swings)
+        for _r in results:
+            _pid = _r.get("pivot_idx")
+            if _r.get("found") and _pid and (_last - max(_pid)) > _recency:
+                _r["found"]    = False
+                _r["quality"]  = "NONE"
+                _r["conf_pts"] = 0
+                _r["stale"]    = True
+
     return results
 
 
@@ -1950,6 +1980,8 @@ def harmonic_near_miss(swings: List[Tuple[int, float]]) -> Optional[Dict[str, An
             return 0.0
         return min(abs(r - lo), abs(r - hi))
 
+    last_idx = swings[-1][0]                       # <- ADDED [H5]
+    recency  = _recency_limit(swings)              # <- ADDED [H5]
     best: Optional[Tuple[float, Dict[str, Any]]] = None
     for pat in XABCD_PATTERNS:
         d_spec  = pat["D_constraint"]
@@ -1957,6 +1989,9 @@ def harmonic_near_miss(swings: List[Tuple[int, float]]) -> Optional[Dict[str, An
         is_ext  = pat.get("D_is_extension", False)
         bs, cs, ps = pat["B_of_XA"], pat["C_of_AB"], pat["D_proj_CD_BC"]
         for i in range(len(prices) - 3):
+            # [H5] only the RECENT tail is tradeable — skip windows whose C pivot is stale.
+            if (last_idx - swings[i + 3][0]) > recency:
+                continue
             x, a, b, c = prices[i], prices[i + 1], prices[i + 2], prices[i + 3]
             xa = abs(a - x); ab = abs(b - a); bc = abs(c - b)
             if min(xa, ab, bc) < 1e-10:
@@ -1985,7 +2020,11 @@ def harmonic_near_miss(swings: List[Tuple[int, float]]) -> Optional[Dict[str, An
                     "miss":      round(miss, 4),
                     "pivot_idx": [swings[i][0], swings[i + 1][0], swings[i + 2][0], swings[i + 3][0]],
                 })
-    return best[1] if best else None
+    # [H5] a "near-miss" must actually be NEAR. If the closest RECENT candidate still needs a
+    # large extra tolerance it is not a near-miss — it is no pattern. Cap it so the UI shows a
+    # truthful "no harmonic" instead of a junk readout (Carney near-miss ≈ a few % extra room).
+    NEAR_MISS_MAX = 0.10
+    return best[1] if (best and best[0] <= NEAR_MISS_MAX) else None
 
 
 def compute_proximity_readouts(                                   # <- NEW [PROX]
