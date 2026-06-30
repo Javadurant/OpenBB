@@ -499,7 +499,10 @@ HARMONIC_CYPHER: Dict[str, Any] = {
     "name": "CYPHER",
     "source": "[CV3] — Cypher",
     "B_of_XA": {"lo": 0.382, "hi": 0.618, "tol": 0.02, "formula": "AB_len / XA_len"},
-    "C_of_XA": {"lo": 1.272, "hi": 1.414, "tol": 0.02, "formula": "XC_len / XA_len (EXTENSION)"},
+    # PARITY: TradingFinder HP.XABCD Cypher uses C-of-XA window 1.13-1.414 (vs Carney
+    # 1.272-1.414). Matched to the TradingView script per user decision so we draw the
+    # same Cyphers it draws. See ta_engine/golden/cypher_btc_tradingfinder.json.
+    "C_of_XA": {"lo": 1.130, "hi": 1.414, "tol": 0.02, "formula": "XC_len / XA_len (EXTENSION)"},
     "D_of_XC": {"ideal": 0.786, "tol": 0.024, "formula": "CD_len / XC_len"},
 }
 

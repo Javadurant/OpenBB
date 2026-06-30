@@ -42,14 +42,16 @@ def test_committed_cypher_ratios_within_tradingfinder_windows():
     assert ratio_within_window(res["ratios"]["XC_XA"], w["C_of_XA"])
 
 
-def test_parity_divergence_carney_vs_tradingfinder_c_window():
-    # DOCUMENTED DIVERGENCE: a Cypher that TradingFinder draws (C/XA = 1.18, inside
-    # its 1.13-1.414 window) is REJECTED by the committed detector (Carney 1.272-
-    # 1.414). This test pins the current behavior and makes the gap reviewable.
+def test_cypher_c_window_matches_tradingfinder_lower_bound():
+    # PARITY DECISION (user: "match TradingFinder exactly"): a Cypher with C/XA = 1.18
+    # sits inside TradingFinder's C-of-XA window (1.13-1.414) and IS drawn by the
+    # script, so our detector must now ALSO find it (it previously rejected it under
+    # the Carney 1.272 lower bound).
     X, A = 63825.0, 64310.0
     XA = A - X
     B = A - 0.465 * XA
-    C = X + 1.18 * XA                       # TradingFinder-valid, Carney-invalid
+    C = X + 1.18 * XA                       # inside TradingFinder window, below Carney's
     res = detect_cypher([(0, X), (1, A), (2, B), (3, C)])
-    assert res["found"] is False
-    assert res["ratios"]["XC_XA"] < 1.272   # confirms it sits in the divergence zone
+    assert res["found"] is True
+    assert res["pattern"] == "CYPHER"
+    assert 1.13 <= res["ratios"]["XC_XA"] <= 1.414
