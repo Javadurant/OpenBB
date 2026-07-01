@@ -804,7 +804,10 @@ def _fetch_ohlcv(ticker: str, years: int = 2) -> pd.DataFrame:
     import time as _time
     for attempt in range(3):
         try:
-            df = yf.Ticker(ticker).history(start=start, auto_adjust=True)
+            # PARITY [harmonic]: auto_adjust=False -> RAW (unadjusted) to match TradingView's
+            # OMXSTO feed. auto_adjust=True gave SEB ~170 in Oct'25; TradingView shows ~181
+            # (= our Cypher D 180.89). Verified empirically 2026-07-01.
+            df = yf.Ticker(ticker).history(start=start, auto_adjust=False)
             if not df.empty:
                 df.columns = [c.lower() for c in df.columns]
                 df.index   = pd.to_datetime(df.index)
@@ -813,7 +816,7 @@ def _fetch_ohlcv(ticker: str, years: int = 2) -> pd.DataFrame:
             logger.warning("yfinance history [%s] attempt %d: %s", ticker, attempt + 1, exc)
         _time.sleep(0.6 * (attempt + 1))   # linear backoff between Yahoo hits
     try:
-        df = yf.download(ticker, start=start, auto_adjust=True, progress=False)
+        df = yf.download(ticker, start=start, auto_adjust=False, progress=False)
         if df is not None and not df.empty:
             if isinstance(df.columns, pd.MultiIndex):   # yf.download may return MultiIndex cols
                 df.columns = df.columns.get_level_values(0)
@@ -849,7 +852,7 @@ def _fetch_ohlcv_tf(ticker: str, timeframe: str = "daily") -> pd.DataFrame:
     import time as _time
     for attempt in range(3):
         try:
-            df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+            df = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
             if not df.empty:
                 df.columns = [c.lower() for c in df.columns]
                 df.index   = pd.to_datetime(df.index)
@@ -858,7 +861,7 @@ def _fetch_ohlcv_tf(ticker: str, timeframe: str = "daily") -> pd.DataFrame:
             logger.warning("yfinance tf history [%s/%s] attempt %d: %s", ticker, tf, attempt + 1, exc)
         _time.sleep(0.6 * (attempt + 1))
     try:
-        df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
+        df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
         if df is not None and not df.empty:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
