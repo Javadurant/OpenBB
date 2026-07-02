@@ -35,7 +35,9 @@ try:
 except Exception as _e:                                    # pragma: no cover
     logger.warning("ta_engine harmonics unavailable: %s", _e)
     _scan_harmonics_tv = None
-_HARMONIC_DEPTH = 5   # pivot-lookback bars — TradingView harmonic default
+_HARMONIC_DEPTH = 2   # pivot-lookback bars — matches TradingView's fine ZigZag (verified
+                      # against the "Harmonic Pattern Detection" indicator's drawn pivots on
+                      # OMXSTO:SEB_A: depth=2 reproduces its Butterfly + Bat X-A-B-C exactly).
 
 
 def _harmonics_tv(df: Any) -> List[Dict[str, Any]]:

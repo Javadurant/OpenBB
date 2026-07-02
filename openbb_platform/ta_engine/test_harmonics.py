@@ -86,3 +86,14 @@ def test_scan_patterns_returns_reports_sorted_recent_first():
     assert idxs == sorted(idxs, reverse=True)   # recency-desc
     for r in out:
         assert r["found"] is True and len(r["pivot_idx"]) == 5
+
+
+def test_detect_forming_bat_from_tradingview_pivots():
+    # TradingView Bearish Bat X-A-B-C (D projected). Exact pivots pulled from the chart.
+    from ta_engine.harmonics import detect_forming
+    m = detect_forming([(0, 190.9), (2, 180.35), (4, 186.0), (6, 181.5)])
+    assert m is not None
+    assert m.pattern == "BAT"          # priority order picks Bat over Crab for AB/XA~0.536
+    assert m.direction == "bearish"
+    assert len(m.pivots) == 5          # projected D appended
+    assert m.pivots[4][1] > 186        # bearish D projected above C

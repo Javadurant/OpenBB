@@ -114,7 +114,7 @@ def _grade(dev: float) -> str:
     return "LOOSE"
 
 
-def pattern_report(m: "HarmonicMatch") -> Dict:
+def pattern_report(m: "HarmonicMatch", status: str = "confirmed") -> Dict:
     """Expand a HarmonicMatch into the TradingView info-box payload: pivot labels,
     the Actual/%Err/Theoretical ratio table, a 0-100 score, and entry/stop/targets.
 
@@ -154,6 +154,7 @@ def pattern_report(m: "HarmonicMatch") -> Dict:
 
     return {
         "pattern": m.pattern, "direction": m.direction, "found": True,
+        "status": status, "forming": status == "forming",
         "quality": _grade(m.deviation), "deviation": m.deviation,
         "pivot_idx": [xi, ai, bi, ci, di], "pivot_labels": ["X", "A", "B", "C", "D"],
         "pivot_prices": [round(X,4), round(A,4), round(B,4), round(C,4), round(D,4)],
@@ -164,17 +165,94 @@ def pattern_report(m: "HarmonicMatch") -> Dict:
     }
 
 
-def scan_patterns(highs: Sequence[float], lows: Sequence[float], depth: int = 5,
-                  tol: float = 0.12, max_patterns: int = 25) -> List[Dict]:
-    """Full harmonic scan: pivot-lookback ZigZag -> slide 5-pivot windows through the
+def scan_patterns(highs: Sequence[float], lows: Sequence[float], depth: int = 2,
+                  tol: float = 0.12, max_patterns: int = 40,
+                  include_forming: bool = True) -> List[Dict]:
+    """Full harmonic scan: pivot-lookback ZigZag -> slide windows through the
     TradingView-convention classifier -> TradingView info-box reports, recency-first.
-    Symbol/timeframe agnostic (works on any OHLC)."""
+
+    Returns both CONFIRMED patterns (5 real pivots) and, when include_forming, FORMING
+    patterns (4 real pivots X-A-B-C with D projected) — matching how TradingView surfaces
+    in-progress patterns (e.g. the failed Bat whose D never completed). Symbol/timeframe
+    agnostic."""
     from .pivots import pivot_zigzag
     sw = pivot_zigzag(highs, lows, depth)
     out: List[Dict] = []
+    completed: set = set()                             # (pattern, C-bar) to dedup forming
     for i in range(len(sw) - 4):
         m = detect_harmonic(sw[i:i + 5], tol)
         if m is not None:
-            out.append(pattern_report(m))
+            out.append(pattern_report(m, status="confirmed"))
+            completed.add((m.pattern, m.pivots[3][0]))
+    if include_forming:
+        # Only the recent tail: a genuinely still-forming pattern completes near the right
+        # edge. Scanning every historical 4-pivot window would project long-resolved D's
+        # (noise). C (i+3) must sit within the last ~6 pivots.
+        for i in range(max(0, len(sw) - 9), len(sw) - 3):
+            m = detect_forming(sw[i:i + 4], tol)
+            if m is not None and (m.pattern, m.pivots[3][0]) not in completed:
+                out.append(pattern_report(m, status="forming"))
     out.sort(key=lambda r: r["pivot_idx"][-1], reverse=True)
     return out[:max_patterns]
+
+
+# Priority order for classifying a FORMING pattern (X-A-B-C, D projected). Tighter /
+# more specific patterns first, so an ambiguous AB/XA (e.g. 0.536, valid for both Bat and
+# Crab) resolves the way TradingView's indicator does — Bat before Crab.
+_FORMING_PRIORITY = ("CYPHER", "BAT", "GARTLEY", "BUTTERFLY", "CRAB", "DEEP_CRAB")
+
+
+def _project_d(name: str, spec: Dict[str, Window], direction: str,
+               X: float, A: float, C: float) -> float:
+    """Project the completion price D from X-A-B-C using the pattern's D ratio."""
+    xa, xc = abs(A - X), abs(C - X)
+    sign = -1.0 if direction == "bullish" else 1.0   # bullish D is a low, bearish a high
+    if "CD_XC" in spec:                               # Cypher: D = 0.786 retrace of XC off C
+        r = (spec["CD_XC"][0] + spec["CD_XC"][1]) / 2
+        return C + sign * r * xc
+    if "AD_XA" in spec:                               # most patterns: D relative to A
+        r = (spec["AD_XA"][0] + spec["AD_XA"][1]) / 2
+        return A + sign * r * xa
+    return A + sign * xa
+
+
+def detect_forming(pivots: List[Tuple[int, float]], tol: float = 0.12
+                   ) -> Optional["HarmonicMatch"]:
+    """Classify a still-forming pattern from 4 pivots (X, A, B, C), projecting D.
+
+    Only AB/XA and BC/AB (computable before D completes) are matched; D is projected to
+    the pattern's ideal ratio. Patterns are tried in _FORMING_PRIORITY order and the FIRST
+    that fits wins (mirrors how TradingView labels ambiguous forming pivots)."""
+    if len(pivots) < 4:
+        return None
+    (xi, X), (ai, A), (bi, B), (ci, C) = pivots[:4]
+    if X < A > B < C:
+        direction = "bullish"
+    elif X > A < B > C:
+        direction = "bearish"
+    else:
+        return None
+    xa, ab, bc = abs(A - X), abs(B - A), abs(C - B)
+    if xa < 1e-9 or ab < 1e-9:
+        return None
+    ab_xa, bc_ab = ab / xa, bc / ab
+    for name in _FORMING_PRIORITY:
+        spec = HARMONIC_SPECS[name]
+        total, ok = 0.0, True
+        for key, win in spec.items():
+            if key not in ("AB_XA", "BC_AB"):
+                continue
+            dv = _dev(ab_xa if key == "AB_XA" else bc_ab, win, tol)
+            if dv is None:
+                ok = False
+                break
+            total += dv
+        if not ok:
+            continue
+        D = _project_d(name, spec, direction, X, A, C)
+        di = ci + max(1, ci - bi)                      # projected D bar (rough, ahead of C)
+        return HarmonicMatch(pattern=name, direction=direction,
+                             ratios={k: round(v, 4) for k, v in _ratios(X, A, B, C, D).items()},
+                             deviation=round(total, 4),
+                             pivots=[(xi, X), (ai, A), (bi, B), (ci, C), (di, D)])
+    return None
