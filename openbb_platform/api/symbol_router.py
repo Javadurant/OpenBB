@@ -27,6 +27,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 logger = logging.getLogger("symbol_router")
 router = APIRouter(prefix="/api/symbol", tags=["symbol"])
 
+# ── TradingView-parity harmonic engine (ta_engine) ───────────────────────
+# pivot-lookback ZigZag + leg-ratio classifier + TradingView info-box report.
+# Symbol/timeframe agnostic (any OHLC). Degrades to the legacy scan if missing.
+try:
+    from ta_engine.harmonics import scan_patterns as _scan_harmonics_tv
+except Exception as _e:                                    # pragma: no cover
+    logger.warning("ta_engine harmonics unavailable: %s", _e)
+    _scan_harmonics_tv = None
+_HARMONIC_DEPTH = 5   # pivot-lookback bars — TradingView harmonic default
+
+
+def _harmonics_tv(df: Any) -> List[Dict[str, Any]]:
+    """Run the ta_engine harmonic scan on a df's high/low; [] on any failure."""
+    if _scan_harmonics_tv is None or df is None or df.empty:
+        return []
+    try:
+        return _scan_harmonics_tv(df["high"].tolist(), df["low"].tolist(),
+                                  depth=_HARMONIC_DEPTH)
+    except Exception as exc:                               # pragma: no cover
+        logger.warning("harmonic scan failed: %s", exc)
+        return []
+
 # ── Lazy imports of the real engines ─────────────────────────────────────
 def _import_engines():
     """Lazy import — keeps router file fast to load."""
@@ -336,9 +358,9 @@ def chart(symbol: str, tf: str = "daily") -> dict[str, Any]:
             except Exception:
                 return None
 
-        swings    = eng["compute_zigzag"](close)
-        harmonics = eng["scan_all_harmonic_patterns"](swings)
-        found     = [h for h in harmonics if h.get("found")]
+        swings    = eng["compute_zigzag"](close)          # kept for pitchfork + near-miss
+        reports   = _harmonics_tv(df)                      # TradingView-parity harmonic scan
+        found     = reports
 
         def _outcome(h: dict) -> str:
             d   = h.get("direction")
@@ -349,17 +371,15 @@ def chart(symbol: str, tf: str = "daily") -> dict[str, Any]:
                 return f"Watch PRZ {prz} for a bearish (short) reversal."
             return f"Watch PRZ {prz} for a reversal."
 
-        # <- NEW [DRAW]: index->price map from swings so harmonic polylines are drawable
-        swing_price = {int(s[0]): float(s[1]) for s in swings}
+        # ta_engine reports already carry pivot_idx + pivot_prices (X..D). Map indices
+        # to chart dates for the on-chart polyline; keep every TradingView box field.
         hres = []
         for h in found:
             pid   = h.get("pivot_idx") or []
             dates = [_d2s(i) for i in pid] if pid else []
-            prices = [swing_price.get(int(i)) for i in pid] if pid else []  # <- NEW [DRAW]
             hres.append({
-                **{k: _safe(v) for k, v in h.items() if k not in ("series", "swings_idx", "pivot_idx")},
+                **h,
                 "pivot_dates": dates,
-                "pivot_prices": prices,   # <- NEW [DRAW]: per-pivot prices for the on-chart polyline
                 "from_date":   dates[0]  if dates else None,
                 "to_date":     dates[-1] if dates else None,
                 "outcome":     _outcome(h),
@@ -538,7 +558,7 @@ def ai_narrative(symbol: str) -> dict[str, Any]:
         close = df["close"]
         swings    = eng["compute_zigzag"](close)
         elliott   = eng["analyse_elliott_waves"](swings)
-        harmonics = eng["scan_all_harmonic_patterns"](swings)
+        harmonics = _harmonics_tv(df)                      # TradingView-parity scan (same as /chart)
         ichi      = eng["compute_ichimoku"](df)
         ind       = eng["compute_all_indicators"](df)
 

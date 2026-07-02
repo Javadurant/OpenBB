@@ -56,3 +56,33 @@ def test_butterfly_ratios_do_not_misclassify_as_bat():
     # Butterfly AB/XA ~0.786 must NOT be read as a Bat (AB/XA 0.382-0.5).
     m = detect_harmonic(_prices_bear_butterfly())
     assert m.pattern != "BAT"
+
+
+def test_pattern_report_has_tradingview_box_fields():
+    from ta_engine.harmonics import detect_harmonic, pattern_report
+    rep = pattern_report(detect_harmonic(_prices_bull_cypher()))
+    assert rep["pattern"] == "CYPHER"
+    assert rep["direction"] == "bullish"
+    assert rep["pivot_labels"] == ["X", "A", "B", "C", "D"]
+    assert len(rep["pivot_idx"]) == 5
+    # TradingView info-box: ratios table with theoretical windows + a 0-100 score
+    assert any(r["name"] == "AB/XA" for r in rep["ratios_table"])
+    assert all({"name", "actual", "pct_err", "theoretical"} <= set(r) for r in rep["ratios_table"])
+    assert 0 <= rep["score"] <= 100
+    # bullish: targets above entry, stop below entry
+    assert rep["target1"] > rep["entry"] > rep["stop"]
+
+
+def test_scan_patterns_returns_reports_sorted_recent_first():
+    from ta_engine.harmonics import scan_patterns
+    # Build a series with a clean bullish Cypher near the end via explicit pivots is
+    # fiddly; instead assert the API shape + recency ordering on any finds.
+    import math
+    # a gently oscillating series (may or may not contain patterns) — shape check only
+    series = [100 + 8 * math.sin(i / 3.0) + i * 0.05 for i in range(120)]
+    out = scan_patterns(series, series, depth=3)
+    assert isinstance(out, list)
+    idxs = [r["pivot_idx"][-1] for r in out]
+    assert idxs == sorted(idxs, reverse=True)   # recency-desc
+    for r in out:
+        assert r["found"] is True and len(r["pivot_idx"]) == 5

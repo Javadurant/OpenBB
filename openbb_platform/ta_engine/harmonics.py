@@ -99,3 +99,82 @@ def detect_harmonic(pivots: List[Tuple[int, float]], tol: float = 0.12
                                  ratios={k: round(v, 4) for k, v in rr.items()},
                                  deviation=round(total, 4), pivots=list(pivots[:5]))
     return best
+
+
+_RATIO_ORDER = ("AB_XA", "BC_AB", "CD_BC", "AD_XA", "CD_XC")
+
+
+def _grade(dev: float) -> str:
+    if dev <= 0.0:
+        return "PERFECT"
+    if dev <= 0.05:
+        return "GOOD"
+    if dev <= 0.12:
+        return "FAIR"
+    return "LOOSE"
+
+
+def pattern_report(m: "HarmonicMatch") -> Dict:
+    """Expand a HarmonicMatch into the TradingView info-box payload: pivot labels,
+    the Actual/%Err/Theoretical ratio table, a 0-100 score, and entry/stop/targets.
+
+    Targets/stop use standard harmonic Fib projections of the A->D leg (Target 1 =
+    0.382, Target 2 = 0.618; stop = 0.236 beyond D). %Err is distance to the nearest
+    theoretical bound (0 inside the window). Exact TradingView target/score formulas
+    need the Pine source; these are the standard-harmonic equivalents.
+    """
+    (xi, X), (ai, A), (bi, B), (ci, C), (di, D) = m.pivots[:5]
+    spec = HARMONIC_SPECS[m.pattern]
+
+    table: List[Dict] = []
+    accs: List[float] = []
+    for key in _RATIO_ORDER:
+        if key not in spec:
+            continue
+        lo, hi = spec[key]
+        actual = m.ratios[key]
+        if lo <= actual <= hi:
+            err = 0.0
+        else:
+            nb = lo if abs(actual - lo) < abs(actual - hi) else hi
+            err = (abs(actual - nb) / nb * 100.0) if nb else 0.0
+        theo = f"{lo:g}" if abs(lo - hi) < 1e-9 else f"{lo:g} | {hi:g}"
+        table.append({"name": key.replace("_", "/"), "actual": round(actual, 3),
+                      "pct_err": round(err, 1), "theoretical": theo})
+        accs.append(max(0.0, 100.0 - err))
+
+    leg_acc = round(sum(accs) / len(accs), 2) if accs else 0.0
+    dirn = 1.0 if m.direction == "bullish" else -1.0
+    ad = abs(D - A)
+    entry = round(D, 4)
+    stop = round(D - dirn * 0.236 * ad, 4)
+    t1 = round(D + dirn * 0.382 * ad, 4)
+    t2 = round(D + dirn * 0.618 * ad, 4)
+    prz_low, prz_high = sorted((entry, stop))
+
+    return {
+        "pattern": m.pattern, "direction": m.direction, "found": True,
+        "quality": _grade(m.deviation), "deviation": m.deviation,
+        "pivot_idx": [xi, ai, bi, ci, di], "pivot_labels": ["X", "A", "B", "C", "D"],
+        "pivot_prices": [round(X,4), round(A,4), round(B,4), round(C,4), round(D,4)],
+        "ratios": m.ratios, "ratios_table": table,
+        "score": leg_acc, "leg_accuracy": leg_acc,
+        "d_price": entry, "entry": entry, "stop": stop, "target1": t1, "target2": t2,
+        "prz_low": round(prz_low, 4), "prz_high": round(prz_high, 4),
+    }
+
+
+def scan_patterns(highs: Sequence[float], lows: Sequence[float], depth: int = 5,
+                  tol: float = 0.12, max_patterns: int = 25) -> List[Dict]:
+    """Full harmonic scan: pivot-lookback ZigZag -> slide 5-pivot windows through the
+    TradingView-convention classifier -> TradingView info-box reports, recency-first.
+    Symbol/timeframe agnostic (works on any OHLC)."""
+    from .pivots import pivot_zigzag
+    sw = pivot_zigzag(highs, lows, depth)
+    out: List[Dict] = []
+    for i in range(len(sw) - 4):
+        m = detect_harmonic(sw[i:i + 5], tol)
+        if m is not None:
+            out.append(pattern_report(m))
+    out.sort(key=lambda r: r["pivot_idx"][-1], reverse=True)
+    return out[:max_patterns]
