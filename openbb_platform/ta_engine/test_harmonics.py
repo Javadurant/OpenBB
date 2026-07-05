@@ -97,3 +97,14 @@ def test_detect_forming_bat_from_tradingview_pivots():
     assert m.direction == "bearish"
     assert len(m.pivots) == 5          # projected D appended
     assert m.pivots[4][1] > 186        # bearish D projected above C
+
+
+def test_detect_forming_cypher_from_tradingview_pivots():
+    # TradingView Bullish Cypher X-A-B-C (exact pivots pulled from OMXSTO:SEB_A). The D
+    # pivot our ZigZag collapses; forming projects it to 180.89 == TradingView's entry.
+    from ta_engine.harmonics import detect_forming
+    m = detect_forming([(0, 179.1), (2, 186.35), (4, 182.35), (6, 187.45)])
+    assert m is not None
+    assert m.pattern == "CYPHER"
+    assert m.direction == "bullish"
+    assert abs(m.pivots[4][1] - 180.89) < 0.5     # projected D matches TV entry 180.886

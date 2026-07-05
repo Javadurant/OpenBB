@@ -177,21 +177,41 @@ def scan_patterns(highs: Sequence[float], lows: Sequence[float], depth: int = 2,
     agnostic."""
     from .pivots import pivot_zigzag
     sw = pivot_zigzag(highs, lows, depth)
+    n = len(highs)
     out: List[Dict] = []
-    completed: set = set()                             # (pattern, C-bar) to dedup forming
+    seen: set = set()                                  # (pattern, C-bar) dedup
+    # 1. CONFIRMED patterns: 5 real pivots (D is an actual ZigZag pivot).
     for i in range(len(sw) - 4):
         m = detect_harmonic(sw[i:i + 5], tol)
         if m is not None:
             out.append(pattern_report(m, status="confirmed"))
-            completed.add((m.pattern, m.pivots[3][0]))
+            seen.add((m.pattern, m.pivots[3][0]))
+    # 2. PROJECTED-D patterns: X-A-B-C fits, D projected to the ideal ratio. Kept only when
+    #    price actually reached the projected PRZ (a real pattern, e.g. TradingView's Cypher
+    #    whose D pivot our ZigZag collapsed) or the pattern is still forming near the right
+    #    edge. Windows whose PRZ was never approached are pure geometry -> dropped.
     if include_forming:
-        # Only the recent tail: a genuinely still-forming pattern completes near the right
-        # edge. Scanning every historical 4-pivot window would project long-resolved D's
-        # (noise). C (i+3) must sit within the last ~6 pivots.
-        for i in range(max(0, len(sw) - 9), len(sw) - 3):
+        for i in range(len(sw) - 3):
             m = detect_forming(sw[i:i + 4], tol)
-            if m is not None and (m.pattern, m.pivots[3][0]) not in completed:
-                out.append(pattern_report(m, status="forming"))
+            if m is None or (m.pattern, m.pivots[3][0]) in seen:
+                continue
+            ci = m.pivots[3][0]                         # C bar index
+            prz = m.pivots[4][1]                        # projected D price
+            band = abs(prz) * 0.015
+            look_end = min(n, ci + 40)
+            reached = any(
+                (lows[b] <= prz + band) if m.direction == "bullish" else (highs[b] >= prz - band)
+                for b in range(ci + 1, look_end)
+            )
+            recent = ci >= n - 12
+            if reached:
+                status = "confirmed"                   # completed at the PRZ
+            elif recent:
+                status = "forming"                     # still in progress near the edge
+            else:
+                continue                               # never approached -> noise
+            out.append(pattern_report(m, status=status))
+            seen.add((m.pattern, ci))
     out.sort(key=lambda r: r["pivot_idx"][-1], reverse=True)
     return out[:max_patterns]
 
