@@ -778,6 +778,68 @@ class MasterSignal(TypedDict):
 # SECTION 6 — DATA FETCHING
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ── Exchange-native data feed: EOD Historical Data (EODHD) ───────────────────
+# EODHD sources OHLCV directly from the listing exchange, so it matches the feed
+# TradingView uses (verified pivot-exact vs OMXSTO on SEB-A.ST / VOLV-B.ST). This
+# removes the sub-unit yfinance drift that broke fine harmonic pivots. Generic:
+# covers global equities, ETFs, funds, indices, crypto & FX. Raw (unadjusted) close.
+def _dotenv_get(name: str):
+    import os, pathlib
+    v = os.getenv(name)
+    if v:
+        return v
+    for p in (pathlib.Path(".env"), pathlib.Path(__file__).resolve().parent.parent / ".env"):
+        try:
+            if p.exists():
+                for line in p.read_text().splitlines():
+                    if line.startswith(name + "="):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+        except Exception:
+            pass
+    return None
+
+
+def _eodhd_symbol(ticker: str) -> str:
+    """Map a yfinance-style ticker to EODHD's SYMBOL.EXCHANGE format."""
+    t = ticker.strip().upper()
+    if "." in t:
+        return t                                   # already exchange-suffixed (VOLV-B.ST, BMW.DE)
+    if t.endswith("-USD") or t.endswith("USDT"):
+        return t.replace("-USD", "") + "-USD.CC"   # crypto (best-effort)
+    if "=X" in t:
+        return t.replace("=X", "") + ".FOREX"      # FX (best-effort)
+    return t + ".US"                               # bare US equity / ETF
+
+
+def _fetch_eodhd(ticker: str, start: str, period: str = "d") -> pd.DataFrame:
+    """Exchange-native OHLCV from EODHD. period in {'d','w','m'}. Empty df on any
+    failure so callers transparently fall back to the OpenBB/yfinance chain."""
+    key = _dotenv_get("EODHD_API_KEY")
+    if not key:
+        return pd.DataFrame()
+    try:
+        import urllib.request, urllib.parse, json as _json
+        sym = urllib.parse.quote(_eodhd_symbol(ticker))
+        url = (f"https://eodhd.com/api/eod/{sym}?api_token={key}&fmt=json"
+               f"&from={start}&period={period}")
+        with urllib.request.urlopen(url, timeout=15) as r:
+            rows = _json.loads(r.read())
+        if not rows or not isinstance(rows, list):
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        if df.empty or "close" not in df:
+            return pd.DataFrame()
+        df.index = pd.to_datetime(df["date"])
+        for c in ("open", "high", "low", "close", "volume"):
+            if c not in df:
+                df[c] = float("nan")
+        df = df[["open", "high", "low", "close", "volume"]].astype(float)
+        return df
+    except Exception as exc:
+        logger.warning("EODHD [%s]: %s", ticker, exc)
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=CACHE_TTL)
 def _fetch_ohlcv(ticker: str, years: int = 2) -> pd.DataFrame:
     """
@@ -785,6 +847,9 @@ def _fetch_ohlcv(ticker: str, years: int = 2) -> pd.DataFrame:
     Columns lowercased. DatetimeIndex returned.
     """
     start = (datetime.date.today() - datetime.timedelta(days=365 * years)).strftime("%Y-%m-%d")
+    df = _fetch_eodhd(ticker, start, "d")          # <- exchange-native primary (matches TradingView)
+    if not df.empty:
+        return df
     if _OBB_AVAILABLE:
         try:
             res = _obb.equity.price.historical(ticker, start_date=start, provider="yfinance")
@@ -846,6 +911,13 @@ def _fetch_ohlcv_tf(ticker: str, timeframe: str = "daily") -> pd.DataFrame:
     tf = (timeframe or "daily").lower()
     if tf == "daily" or tf not in _TF_YF:
         return _fetch_ohlcv(ticker, years=2)
+    # exchange-native primary for weekly/monthly (EODHD supports period w/m directly).
+    _eod_p = {"weekly": "w", "monthly": "m"}.get(tf)
+    if _eod_p:
+        _start = (datetime.date.today() - datetime.timedelta(days=365 * 6)).strftime("%Y-%m-%d")
+        _edf = _fetch_eodhd(ticker, _start, _eod_p)
+        if not _edf.empty:
+            return _edf
     period, interval = _TF_YF[tf]
     # FIXED [SEB-A.ST 404]: same Yahoo rate-limit resilience as _fetch_ohlcv —
     # retry with backoff, then fall back to yf.download before giving up.
