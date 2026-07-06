@@ -849,6 +849,21 @@ def _fetch_ohlcv(ticker: str, years: int = 2) -> pd.DataFrame:
     start = (datetime.date.today() - datetime.timedelta(days=365 * years)).strftime("%Y-%m-%d")
     df = _fetch_eodhd(ticker, start, "d")          # <- exchange-native primary (matches TradingView)
     if not df.empty:
+        # DEPTH BACKFILL: EODHD's plan caps EOD history (~250 bars). Prepend older bars from
+        # yfinance so the chart keeps full depth while the RECENT window stays exchange-exact.
+        # Both are raw (unadjusted) so they join continuously; EODHD wins on any overlap.
+        try:
+            _y = yf.Ticker(ticker).history(start=start, auto_adjust=False)
+            if not _y.empty:
+                _y.columns = [c.lower() for c in _y.columns]
+                _yi = pd.to_datetime(_y.index)
+                _y.index = _yi.tz_localize(None) if _yi.tz is not None else _yi
+                older = _y.loc[_y.index < df.index[0], ["open", "high", "low", "close", "volume"]]
+                if not older.empty:
+                    df = pd.concat([older, df])
+                    df = df[~df.index.duplicated(keep="last")].sort_index()
+        except Exception as exc:
+            logger.warning("EODHD depth backfill [%s]: %s", ticker, exc)
         return df
     if _OBB_AVAILABLE:
         try:
@@ -913,12 +928,24 @@ def _fetch_ohlcv_tf(ticker: str, timeframe: str = "daily") -> pd.DataFrame:
         return _fetch_ohlcv(ticker, years=2)
     # exchange-native primary for weekly/monthly (EODHD supports period w/m directly).
     _eod_p = {"weekly": "w", "monthly": "m"}.get(tf)
+    period, interval = _TF_YF[tf]
     if _eod_p:
         _start = (datetime.date.today() - datetime.timedelta(days=365 * 6)).strftime("%Y-%m-%d")
         _edf = _fetch_eodhd(ticker, _start, _eod_p)
         if not _edf.empty:
+            try:  # DEPTH BACKFILL: prepend older yfinance bars (see _fetch_ohlcv)
+                _y = yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=False)
+                if not _y.empty:
+                    _y.columns = [c.lower() for c in _y.columns]
+                    _yi = pd.to_datetime(_y.index)
+                    _y.index = _yi.tz_localize(None) if _yi.tz is not None else _yi
+                    older = _y.loc[_y.index < _edf.index[0], ["open", "high", "low", "close", "volume"]]
+                    if not older.empty:
+                        _edf = pd.concat([older, _edf])
+                        _edf = _edf[~_edf.index.duplicated(keep="last")].sort_index()
+            except Exception as exc:
+                logger.warning("EODHD tf backfill [%s/%s]: %s", ticker, tf, exc)
             return _edf
-    period, interval = _TF_YF[tf]
     # FIXED [SEB-A.ST 404]: same Yahoo rate-limit resilience as _fetch_ohlcv —
     # retry with backoff, then fall back to yf.download before giving up.
     import time as _time
