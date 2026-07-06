@@ -196,20 +196,34 @@ def scan_patterns(highs: Sequence[float], lows: Sequence[float], depth: int = 2,
             if m is None or (m.pattern, m.pivots[3][0]) in seen:
                 continue
             ci = m.pivots[3][0]                         # C bar index
-            prz = m.pivots[4][1]                        # projected D price
-            band = abs(prz) * 0.015
-            look_end = min(n, ci + 40)
-            reached = any(
-                (lows[b] <= prz + band) if m.direction == "bullish" else (highs[b] >= prz - band)
-                for b in range(ci + 1, look_end)
-            )
-            recent = ci >= n - 12
-            if reached:
-                status = "confirmed"                   # completed at the PRZ
-            elif recent:
-                status = "forming"                     # still in progress near the edge
+            cp = m.pivots[3][1]                         # C price
+            prz = m.pivots[4][1]                        # projected D (ideal PRZ level)
+            bull = m.direction == "bullish"
+            # Find the ACTUAL completion: the FIRST bar after C whose price entered the PRZ
+            # (bullish: a low reaching down to <= PRZ*1.02; bearish: a high up to >= PRZ*0.98).
+            look_end = min(n, ci + 45)
+            comp_bar = comp_price = None
+            for b in range(ci + 1, look_end):
+                if bull and lows[b] <= prz * 1.02:
+                    comp_bar, comp_price = b, lows[b]; break
+                if (not bull) and highs[b] >= prz * 0.98:
+                    comp_bar, comp_price = b, highs[b]; break
+            if comp_bar is not None and prz * 0.95 <= comp_price <= prz * 1.05:
+                # COMPLETED: snap D to the real bar/price price actually reached (like TV) —
+                # NOT the ideal projection. Prevents drawing a completion that never happened.
+                m.pivots[4] = (comp_bar, round(comp_price, 4))
+                status = "confirmed"
             else:
-                continue                               # never approached -> noise
+                # Price never entered the PRZ. Keep only a genuinely still-forming setup near
+                # the right edge whose price has NOT already run away in the wrong direction;
+                # otherwise the projected D never occurred -> drop (removes the false VOLV-B
+                # Cypher where price ran up to 342 instead of down to the 309 PRZ).
+                recent = ci >= n - 8
+                ran_away = (highs[-1] > cp) if bull else (lows[-1] < cp)
+                if recent and not ran_away:
+                    status = "forming"                 # still approaching -> dashed projection
+                else:
+                    continue
             out.append(pattern_report(m, status=status))
             seen.add((m.pattern, ci))
     out.sort(key=lambda r: r["pivot_idx"][-1], reverse=True)

@@ -108,3 +108,16 @@ def test_detect_forming_cypher_from_tradingview_pivots():
     assert m.pattern == "CYPHER"
     assert m.direction == "bullish"
     assert abs(m.pivots[4][1] - 180.89) < 0.5     # projected D matches TV entry 180.886
+
+
+def test_projected_d_not_drawn_when_price_runs_away():
+    # Regression for the VOLV-B false Cypher: a bullish X-A-B-C whose projected D (~105) is
+    # never reached because price RUNS UP after C (123 -> 140) must NOT be reported as a
+    # completed pattern drawn at the ideal projection.
+    from ta_engine.harmonics import scan_patterns
+    # bars crafted so pivot_zigzag(depth=2) yields X100 / A120 / B110 / C123, then price rises.
+    series = [108, 104, 100, 112, 120, 115, 110, 118, 123, 121, 119, 130, 140, 138, 142]
+    out = scan_patterns(series, series, depth=2)
+    # no pattern may be reported at (or near) the un-reached ideal projection (~105).
+    assert all(p["d_price"] > 112 for p in out), \
+        f"a projected-D completion was drawn where price never went: {[(p['pattern'], p['d_price']) for p in out]}"
