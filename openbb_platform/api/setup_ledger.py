@@ -58,6 +58,7 @@ class LedgerEntry(TypedDict, total=False):
     target:       float
     reward_risk:  float
     window_days:  int
+    expected_days: Optional[int]   # v3: base-case trading days (v2 records lack it)
     source:       str
     outcome:      str          # PENDING | WIN | LOSS | EXPIRED | AMBIGUOUS
     resolved_on:  Optional[str]
@@ -124,6 +125,9 @@ def log_setup(setup: dict, *, date_iso: Optional[str] = None) -> bool:
             entry=float(entry), stop=float(stop), target=float(target),
             reward_risk=float(setup.get("reward_risk", 0.0) or 0.0),
             window_days=_parse_window_days(setup.get("time_window_days")),
+            expected_days=(int(setup["expected_trading_days"])
+                           if isinstance(setup.get("expected_trading_days"), (int, float))
+                           else None),
             source=setup.get("source", "?"),
             outcome="PENDING", resolved_on=None, bars_to_resolve=None,
             logged_at=datetime.now(timezone.utc).isoformat(),
@@ -217,6 +221,59 @@ def aggregate() -> dict[str, Any]:
         ),
         "disclaimer": "Decision-support, not advice. Past results do not predict future performance.",
     }
+
+
+def timing_calibration() -> dict[str, Any]:
+    """Historical time-to-target calibration from resolved WIN entries.
+
+    For every WIN with a recorded bars_to_resolve, compare against the
+    predicted base case: v3 records carry expected_days explicitly; v2
+    records only stored the window upper bound, and v2 windows were
+    "base..2*base", so expected is approximated as window_days / 2.
+
+    Returns speed_factor = median(actual / expected), clamped to [0.5, 2.0],
+    plus a median absolute percentage error. WIN-only by construction: this
+    measures HOW FAST targets are reached when they ARE reached - it does not
+    (and must not) restate the hit rate, which lives in aggregate().
+    Per-grade splits are included when each grade clears MIN_SAMPLE_FOR_RATE.
+    """
+    records = _read_all()
+
+    def _samples(rs: list[dict]) -> list[tuple[float, float]]:
+        out = []
+        for r in rs:
+            if r.get("outcome") != "WIN":
+                continue
+            bars = r.get("bars_to_resolve")
+            exp = r.get("expected_days") or (r.get("window_days") or 0) / 2.0
+            if not bars or not exp or exp <= 0:
+                continue
+            out.append((bars / exp, abs(bars - exp) / exp))
+        return out
+
+    def _stats(samples: list[tuple[float, float]]) -> dict[str, Any]:
+        n = len(samples)
+        if n < MIN_SAMPLE_FOR_RATE:
+            return {"n_samples": n, "reliable": False, "speed_factor": 1.0,
+                    "median_abs_pct_error": None,
+                    "note": "insufficient resolved WIN samples for calibration"}
+        ratios = sorted(s[0] for s in samples)
+        errs = sorted(s[1] for s in samples)
+        med = ratios[n // 2]
+        return {"n_samples": n, "reliable": True,
+                "speed_factor": round(max(0.5, min(2.0, med)), 2),
+                "median_actual_over_expected": round(med, 2),
+                "median_abs_pct_error": round(errs[n // 2], 2)}
+
+    overall = _stats(_samples(records))
+    overall["by_grade"] = {
+        g: _stats(_samples([r for r in records if r.get("grade") == g]))
+        for g in ("A", "B", "C")}
+    overall["methodology"] = (
+        "WIN-only calibration on first-touch resolutions: speed_factor is the "
+        "median of actual-bars-to-target over predicted-base-case days. It "
+        "rescales future base-case estimates; it says nothing about hit rate.")
+    return overall
 
 
 # ---------------------------------------------------------------------------

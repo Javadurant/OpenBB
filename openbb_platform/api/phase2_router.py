@@ -433,7 +433,8 @@ _SETUP_CACHE: dict[str, Any] = {"key": None, "at": 0.0, "data": None}
 _SETUP_TTL_SEC = 1800.0
 
 
-def _fetch_and_score(entry: tuple[str, str, str]) -> Optional[dict]:
+def _fetch_and_score(entry: tuple[str, str, str],
+                     calibration: Optional[dict] = None) -> Optional[dict]:
     """Fetch 1y daily history for one (symbol, region, asset_class) and score it."""
     import asyncio
     from .data_ingestion import service as _ingest, DataMissingException  # <- NEW [Phase3-Step1]: ingestion backbone
@@ -458,7 +459,7 @@ def _fetch_and_score(entry: tuple[str, str, str]) -> Optional[dict]:
         # decorate the symbol page. Cheap: ZigZag + ratio checks, no extra I/O.
         from .setup_scanner import build_technical_context as _build_ctx, _atr as _atr_fn
         _atr_v = _atr_fn(highs, lows, closes)
-        tech_ctx = _build_ctx(highs, lows, closes, _atr_v) if _atr_v else None
+        tech_ctx = _build_ctx(highs, lows, closes, _atr_v, symbol=sym) if _atr_v else None
 
         name = sym
         div_yield = None
@@ -481,6 +482,7 @@ def _fetch_and_score(entry: tuple[str, str, str]) -> Optional[dict]:
             as_of=series.as_of.date(),           # v3: timing dates anchored to data date
             technical_context=tech_ctx,          # v3: harmonic conflicts enter the score
             proxy_note=_PROXY_META.get(sym),     # v3: honest proxy labelling
+            calibration=calibration,             # v3: ledger-based timing calibration
         )
         if r is not None:
             # <- NEW [Phase3-Step1]: stamp provenance (council mandate: source + as_of on every series)
@@ -520,10 +522,18 @@ def setup_of_the_day(refresh: bool = False) -> dict[str, Any]:
         cached["cache_age_sec"] = int(now - _SETUP_CACHE["at"])
         return cached
 
+    # v3: ledger-based timing calibration, computed once per scan (pure file read).
+    try:
+        from .setup_ledger import timing_calibration as _timing_calib
+        calibration = _timing_calib()
+    except Exception:  # noqa: BLE001 - calibration is an enhancement, never a blocker
+        logger.warning("timing calibration unavailable", exc_info=True)
+        calibration = None
+
     # Parallel fetch+score across the whole tagged universe.
     scored: list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = {pool.submit(_fetch_and_score, e): e for e in SETUP_UNIVERSE}
+        futs = {pool.submit(_fetch_and_score, e, calibration): e for e in SETUP_UNIVERSE}
         for fut in as_completed(futs):
             r = fut.result()
             if r is not None:
@@ -602,14 +612,21 @@ async def discover_ledger(evaluate: bool = False) -> dict[str, Any]:  # <- NEW [
     """Honest hit-rate track record for surfaced setups: win-rate by grade with
     sample size + methodology + disclaimer. Pass ?evaluate=true to resolve
     newly-matured PENDING entries against subsequent price action first."""
-    from .setup_ledger import aggregate as _aggregate, evaluate_open_entries as _evaluate
+    from .setup_ledger import (aggregate as _aggregate,
+                               evaluate_open_entries as _evaluate,
+                               timing_calibration as _timing_calib)
     if evaluate:
         from .data_ingestion import service as _ingest
         try:
             await _evaluate(_ingest)
         except Exception:  # noqa: BLE001 - never let evaluation break the read
             logger.warning("ledger evaluation failed", exc_info=True)
-    return _aggregate()
+    result = _aggregate()
+    try:
+        result["timing_calibration"] = _timing_calib()  # v3: time-to-target calibration
+    except Exception:  # noqa: BLE001
+        logger.warning("timing calibration failed", exc_info=True)
+    return result
 
 
 @router.get("/api/ai/providers")

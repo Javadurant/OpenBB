@@ -404,7 +404,8 @@ def _median(xs: list) -> float:
 
 def _time_to_target(closes: list, lows: list, atr: float, entry: float,
                     target: float, boll: Optional[dict],
-                    as_of: Optional[date]) -> dict:
+                    as_of: Optional[date],
+                    calibration: Optional[dict] = None) -> dict:
     """Estimate trading-day windows to target from ATR distance + realised speed,
     then cross-check against Fib Time Zones and Ichimoku time numbers counted
     from the anchor pivot. Confluence NUDGES the base case (<= TIMING_SNAP_TOL)
@@ -429,6 +430,19 @@ def _time_to_target(closes: list, lows: list, atr: float, entry: float,
     if boll and boll.get("squeeze"):
         latest = math.ceil(latest * 1.5)
         reasons.append("Bollinger squeeze regime - moves can stall before expansion, window widened")
+
+    # Ledger-based calibration (WIN-only, first-touch): rescale the base case
+    # by the historically-observed median actual/expected speed ratio.
+    calib_err = None
+    calibrated = False
+    if calibration and calibration.get("reliable"):
+        factor = float(calibration.get("speed_factor", 1.0))
+        expected = max(1, round(expected * factor))
+        calib_err = calibration.get("median_abs_pct_error")
+        calibrated = True
+        reasons.append(
+            f"ledger calibration (n={calibration.get('n_samples')}): base case "
+            f"scaled x{factor} from historical target-hit speed")
 
     confluence: list = []
     anchor = _pivot_low_index(lows)
@@ -456,7 +470,7 @@ def _time_to_target(closes: list, lows: list, atr: float, entry: float,
     latest = max(latest, expected)
 
     agree = min(base_legacy, days_by_speed) / max(1, max(base_legacy, days_by_speed))
-    conf = 0.35 + 0.25 * agree + 0.15 * len(hits)
+    conf = 0.35 + 0.25 * agree + 0.15 * len(hits) + (0.05 if calibrated else 0.0)
     conf = max(0.1, min(0.85, conf))  # daily-data ceiling: never claim >0.85
     reliability = "high" if conf >= 0.65 else "medium" if conf >= 0.45 else "low"
 
@@ -474,6 +488,7 @@ def _time_to_target(closes: list, lows: list, atr: float, entry: float,
         "timing_reliability": reliability,
         "timing_reasoning": "; ".join(reasons),
         "timing_confluence_sources": confluence,
+        "historical_calibration_error": calib_err,
         "time_window_days": f"{earliest}-{latest} trading days",
     }
 
@@ -509,11 +524,41 @@ def zigzag_pivots(highs: list, lows: list, atr: float,
     return pivots[-max_pivots:]
 
 
+def _elliott_context(highs: list, lows: list, closes: list,
+                     symbol: str = "SCAN") -> Optional[dict]:
+    """Run the computed Elliott engine (Frost & Prechter rule set) on the daily
+    series. Returns the preferred count's terminal state or None. Never raises."""
+    try:
+        from engine.structure import elliott_wave as ew
+    except Exception:  # noqa: BLE001 - engine optional at scan time
+        return None
+    try:
+        labels = [str(i) for i in range(len(closes))]
+        res = ew.analyze(highs, lows, closes, labels,
+                         symbol=symbol, timeframe="1d",
+                         as_of=labels[-1] if labels else "")
+        pref = res.preferred
+        if pref is None:
+            return None
+        return {
+            "structure": pref.count_type.value,
+            "current_wave": pref.current_wave,
+            "status": pref.status.value,
+            "direction": pref.direction.value,
+            "invalidation": float(pref.invalidation_level),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("elliott context skipped: %s", exc)
+        return None
+
+
 def build_technical_context(highs: list, lows: list, closes: list,
-                            atr: float) -> Optional[dict]:
-    """Run the deep harmonic engine over ZigZag pivots (best effort).
-    Returns {"harmonics": [{name, bullish, d_price, d_index, age_bars}, ...]}
-    or None when the engine is unavailable. Never raises."""
+                            atr: float, symbol: str = "SCAN") -> Optional[dict]:
+    """Run the deep harmonic + Elliott engines (best effort).
+    Returns {"harmonics": [{name, bullish, d_price, age_bars}, ...],
+             "elliott": {structure, current_wave, status, direction,
+                         invalidation} | absent}
+    or None when the engines are unavailable. Never raises."""
     try:
         from engine.analysis.harmonics import HarmonicEngine
     except Exception:  # noqa: BLE001 - engine optional at scan time
@@ -537,7 +582,11 @@ def build_technical_context(highs: list, lows: list, closes: list,
                 "d_price": float(d_price),
                 "age_bars": (len(closes) - 1) - d_idx,
             })
-        return {"harmonics": out}
+        ctx: dict = {"harmonics": out}
+        ell = _elliott_context(highs, lows, closes, symbol)
+        if ell is not None:
+            ctx["elliott"] = ell
+        return ctx
     except Exception as exc:  # noqa: BLE001
         logger.warning("technical context failed: %s", exc)
         return None
@@ -568,9 +617,37 @@ def _context_conflicts(ctx: Optional[dict], price: float, atr: float):
     ell = ctx.get("elliott")
     if isinstance(ell, dict):
         status = str(ell.get("status", "")).upper()
-        if "COMPLETE" in status:
+        direction = str(ell.get("direction", "")).upper()
+        structure = ell.get("structure", "count")
+        wave = ell.get("current_wave", "")
+        done = "COMPLETE" in status  # covers COMPLETE and COMPLETING
+        if direction == "BEARISH":
+            if done:
+                # A finished bearish correction = downside structure exhausted.
+                supports.append(
+                    f"Elliott bearish {structure} {status.lower()} - "
+                    "downside structure exhausted (needs price confirmation)")
+            else:
+                conflicts.append(
+                    f"Elliott preferred count is a bearish {structure} "
+                    f"({wave} {status.lower()}) - structure argues against a buy")
+        elif direction == "BULLISH":
+            if done:
+                conflicts.append(
+                    f"Elliott bullish {structure} marked {status} - upside "
+                    "structure exhausted; correction risk elevated")
+            elif "5" in wave:
+                conflicts.append(
+                    f"Elliott bullish impulse in late-stage {wave} - "
+                    "limited structure left before completion")
+            else:
+                supports.append(
+                    f"Elliott bullish {structure} in progress ({wave})")
+        elif done:
+            # Direction unknown (e.g. context supplied externally): a completed
+            # structure of unknown direction still demands fresh evidence.
             conflicts.append(
-                f"Elliott {ell.get('structure', 'count')} marked COMPLETE - "
+                f"Elliott {structure} marked COMPLETE - "
                 "prior structure exhausted; fresh trend evidence required")
     return conflicts, supports, stale
 
@@ -636,7 +713,8 @@ def score_setup(symbol, region, closes, highs, lows, *,
                 name=None, dividend_yield=None, sector=None, asset_class="equity",
                 as_of: Optional[date] = None,
                 technical_context: Optional[dict] = None,
-                proxy_note: Optional[str] = None):
+                proxy_note: Optional[str] = None,
+                calibration: Optional[dict] = None):
     """Score a single instrument into a SetupResult, or None if data insufficient.
 
     region is a display bucket ('Swedish' | 'International').
@@ -809,7 +887,8 @@ def score_setup(symbol, region, closes, highs, lows, *,
     risk = entry - stop
     target = round(entry + REWARD_RISK * risk, 2)
 
-    timing = _time_to_target(closes, lows, atr, entry, target, boll, as_of)
+    timing = _time_to_target(closes, lows, atr, entry, target, boll, as_of,
+                             calibration=calibration)
 
     strongest_sup = "; ".join(supports[:3]) if supports else "none - weak setup"
     strongest_opp = "; ".join(conflicts[:3]) if conflicts else "no material opposing signals detected"

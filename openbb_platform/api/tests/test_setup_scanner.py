@@ -172,3 +172,134 @@ def test_pullback_scores_higher_than_extended():
     ext_lows = lows[:-1] + [ext_closes[-1] * 0.992]
     ext = score_setup("X", "Swedish", ext_closes, ext_highs, ext_lows)
     assert ext["sub_scores"]["entry_zone"] <= base["sub_scores"]["entry_zone"]
+
+
+# ── Elliott adapter (direction-aware) ────────────────────────────────────────
+
+def test_elliott_bearish_in_progress_is_conflict():
+    closes, highs, lows = trend_series()
+    ctx = {"harmonics": [], "elliott": {
+        "structure": "IMPULSE", "status": "IN_PROGRESS",
+        "direction": "BEARISH", "current_wave": "Wave 3"}}
+    r = score_setup("X", "Swedish", closes, highs, lows, technical_context=ctx)
+    assert any("bearish IMPULSE" in c for c in r["conflicts"])
+
+
+def test_elliott_bearish_complete_is_support_not_conflict():
+    closes, highs, lows = trend_series()
+    ctx = {"harmonics": [], "elliott": {
+        "structure": "ZIGZAG", "status": "COMPLETE",
+        "direction": "BEARISH", "current_wave": "Wave C"}}
+    r = score_setup("X", "Swedish", closes, highs, lows, technical_context=ctx)
+    assert any("downside structure exhausted" in s for s in r["supports"])
+    assert not any("Elliott" in c for c in r["conflicts"])
+
+
+def test_elliott_bullish_complete_is_conflict():
+    closes, highs, lows = trend_series()
+    ctx = {"harmonics": [], "elliott": {
+        "structure": "IMPULSE", "status": "COMPLETE",
+        "direction": "BULLISH", "current_wave": "Wave 5"}}
+    r = score_setup("X", "Swedish", closes, highs, lows, technical_context=ctx)
+    assert any("upside structure exhausted" in c for c in r["conflicts"])
+
+
+def test_elliott_bullish_wave3_is_support():
+    closes, highs, lows = trend_series()
+    ctx = {"harmonics": [], "elliott": {
+        "structure": "IMPULSE", "status": "IN_PROGRESS",
+        "direction": "BULLISH", "current_wave": "Wave 3"}}
+    r = score_setup("X", "Swedish", closes, highs, lows, technical_context=ctx)
+    assert any("bullish IMPULSE in progress" in s for s in r["supports"])
+
+
+def test_elliott_wave5_late_stage_is_caution():
+    closes, highs, lows = trend_series()
+    ctx = {"harmonics": [], "elliott": {
+        "structure": "IMPULSE", "status": "IN_PROGRESS",
+        "direction": "BULLISH", "current_wave": "Wave 5"}}
+    r = score_setup("X", "Swedish", closes, highs, lows, technical_context=ctx)
+    assert any("late-stage" in c for c in r["conflicts"])
+
+
+def test_build_technical_context_includes_elliott_when_engine_present():
+    """Live adapter test: runs the real computed Elliott engine if importable."""
+    import importlib.util
+    if importlib.util.find_spec("engine.structure.elliott_wave") is None:
+        return  # engine not on path in this environment - adapter degrades to None
+    from api.setup_scanner import build_technical_context, _atr
+    closes, highs, lows = trend_series(n=400, amp=0.06)
+    atr = _atr(highs, lows, closes)
+    ctx = build_technical_context(highs, lows, closes, atr, symbol="TEST")
+    assert ctx is not None and "harmonics" in ctx
+    if "elliott" in ctx:  # engine may honestly return no valid count
+        for k in ("structure", "status", "direction", "invalidation"):
+            assert k in ctx["elliott"]
+
+
+# ── Ledger-based timing calibration ──────────────────────────────────────────
+
+def test_calibration_scales_expected_days():
+    closes, highs, lows = trend_series()
+    plain = score_setup("X", "Swedish", closes, highs, lows)
+    calib = {"reliable": True, "speed_factor": 0.5, "n_samples": 100,
+             "median_abs_pct_error": 0.4}
+    fast = score_setup("X", "Swedish", closes, highs, lows, calibration=calib)
+    assert fast["expected_trading_days"] <= plain["expected_trading_days"]
+    assert fast["historical_calibration_error"] == 0.4
+    assert fast["min_trading_days"] <= fast["expected_trading_days"] <= fast["max_trading_days"]
+    assert "ledger calibration" in fast["timing_reasoning"]
+
+
+def test_unreliable_calibration_is_ignored():
+    closes, highs, lows = trend_series()
+    calib = {"reliable": False, "speed_factor": 0.5, "n_samples": 2}
+    r = score_setup("X", "Swedish", closes, highs, lows, calibration=calib)
+    plain = score_setup("X", "Swedish", closes, highs, lows)
+    assert r["expected_trading_days"] == plain["expected_trading_days"]
+    assert r["historical_calibration_error"] is None
+
+
+def test_timing_calibration_math(monkeypatch):
+    from api import setup_ledger as sl
+    fake = [
+        {"outcome": "WIN", "bars_to_resolve": 6, "window_days": 24, "grade": "A"},
+        {"outcome": "WIN", "bars_to_resolve": 3, "window_days": 18, "grade": "A"},
+        {"outcome": "WIN", "bars_to_resolve": 9, "window_days": 18, "grade": "B"},
+        {"outcome": "WIN", "bars_to_resolve": 12, "window_days": 24, "grade": "B"},
+        {"outcome": "WIN", "bars_to_resolve": 5, "window_days": 20, "grade": "C"},
+        {"outcome": "WIN", "bars_to_resolve": 4, "window_days": 16, "grade": "C"},
+        {"outcome": "LOSS", "bars_to_resolve": 2, "window_days": 18, "grade": "A"},
+        # v3-style record with explicit expected_days
+        {"outcome": "WIN", "bars_to_resolve": 10, "expected_days": 10,
+         "window_days": 20, "grade": "A"},
+    ]
+    monkeypatch.setattr(sl, "_read_all", lambda: fake)
+    c = sl.timing_calibration()
+    assert c["reliable"] is True
+    assert c["n_samples"] == 7          # LOSS excluded
+    assert 0.5 <= c["speed_factor"] <= 2.0
+    assert c["median_abs_pct_error"] is not None
+    assert "by_grade" in c and set(c["by_grade"]) == {"A", "B", "C"}
+
+
+def test_timing_calibration_insufficient_data(monkeypatch):
+    from api import setup_ledger as sl
+    monkeypatch.setattr(sl, "_read_all", lambda: [
+        {"outcome": "WIN", "bars_to_resolve": 6, "window_days": 24, "grade": "A"}])
+    c = sl.timing_calibration()
+    assert c["reliable"] is False
+    assert c["speed_factor"] == 1.0
+
+
+def test_ledger_logs_expected_days(tmp_path, monkeypatch):
+    from api import setup_ledger as sl
+    monkeypatch.setattr(sl, "_LEDGER_PATH", str(tmp_path / "ledger.jsonl"))
+    ok = sl.log_setup({
+        "symbol": "TEST.ST", "grade": "B", "entry": 100.0, "stop": 95.0,
+        "target": 110.0, "time_window_days": "5-20 trading days",
+        "expected_trading_days": 10, "as_of": "2026-07-08"})
+    assert ok
+    rec = sl._read_all()[0]
+    assert rec["expected_days"] == 10
+    assert rec["window_days"] == 20
