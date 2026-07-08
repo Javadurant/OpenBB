@@ -117,6 +117,14 @@ CONFLICTED_AT:     Final = 3     # >= this many conflicts => "Conflicted Buy Set
 NEAR_PRZ_ATR:      Final = 1.5   # bearish pattern D within this many ATR = conflict
 FAR_PRZ_ATR:       Final = 3.0   # bullish pattern D beyond this = irrelevant, not support
 
+# -- Corporate-event gap risk (earnings / ex-dividend inside the target window) --
+# Markets are closed ~17.5h/day: an earnings gap opens straight through a stop,
+# and PEAD means the pre-earnings technical structure often does not survive the
+# print. An ex-dividend drop is mechanical: on high-yield Swedish names a single
+# dividend can consume most of a 1.5-ATR stop distance on its own.
+EXDIV_CONFLICT_ATR:       Final = 0.5    # dividend >= 0.5 ATR inside window = conflict
+EARNINGS_TIMING_CONF_CAP: Final = 0.60   # earnings in window: reliability <= "medium"
+
 DIVIDEND_KF_THRESHOLD: Final = 2.0
 TAX_FREE_FLOOR_2026:   Final = 300_000
 
@@ -179,6 +187,7 @@ class SetupResult(TypedDict, total=False):
     timing_reasoning:      str
     timing_confluence_sources: list
     data_quality:          dict
+    events:                dict           # earnings / ex-dividend window flags
     technical_context_used: bool
     debug:                 dict
 
@@ -493,6 +502,59 @@ def _time_to_target(closes: list, lows: list, atr: float, entry: float,
     }
 
 
+def _event_flags(event_context: Optional[dict], start: date,
+                 latest_iso: str, atr: float) -> tuple:
+    """Corporate-event gap-risk checks against the [start, latest_target_date]
+    window. Returns (event_conflicts, events_summary). Pure date math - the
+    router supplies the calendar data; missing/garbage input degrades silently.
+
+    Levels caveat baked into the summary: the price feed is dividend-ADJUSTED
+    (verified 2026-07-08: INVE-B.ST raw 337.1 vs adjusted 333.5), so displayed
+    levels are adjusted terms and diverge from broker quotes around ex-dates."""
+    conflicts: list = []
+    summary: dict = {"earnings_in_window": False, "ex_dividend_in_window": False}
+    if not event_context:
+        return conflicts, summary
+    try:
+        end = date.fromisoformat(latest_iso)
+    except (ValueError, TypeError):
+        return conflicts, summary
+
+    def _parse(v) -> Optional[date]:
+        try:
+            return date.fromisoformat(str(v)[:10])
+        except (ValueError, TypeError):
+            return None
+
+    ed = _parse(event_context.get("next_earnings_date"))
+    if ed is not None:
+        summary["next_earnings_date"] = ed.isoformat()
+        if start <= ed <= end:
+            summary["earnings_in_window"] = True
+            conflicts.append(
+                f"earnings report {ed.isoformat()} inside the target window - "
+                "overnight gap risk a stop cannot protect against (PEAD: the "
+                "pre-earnings structure often does not survive the print)")
+
+    xd = _parse(event_context.get("next_ex_dividend_date"))
+    if xd is not None:
+        summary["next_ex_dividend_date"] = xd.isoformat()
+        amt = event_context.get("dividend_amount")
+        if isinstance(amt, (int, float)) and math.isfinite(amt) and amt > 0:
+            summary["dividend_amount"] = round(float(amt), 4)
+            if atr > EPS:
+                summary["dividend_atr_ratio"] = round(float(amt) / atr, 2)
+        if start <= xd <= end:
+            summary["ex_dividend_in_window"] = True
+            ratio = summary.get("dividend_atr_ratio")
+            if ratio is not None and ratio >= EXDIV_CONFLICT_ATR:
+                conflicts.append(
+                    f"ex-dividend {xd.isoformat()} inside the target window - "
+                    f"the ~{summary['dividend_amount']} dividend is {ratio:.1f} ATR, "
+                    f"a mechanical drop against a {STOP_ATR_MULT} ATR stop")
+    return conflicts, summary
+
+
 # ============================================================================
 # Technical context (harmonic / Elliott) - the Investor AB fix
 # ============================================================================
@@ -714,7 +776,8 @@ def score_setup(symbol, region, closes, highs, lows, *,
                 as_of: Optional[date] = None,
                 technical_context: Optional[dict] = None,
                 proxy_note: Optional[str] = None,
-                calibration: Optional[dict] = None):
+                calibration: Optional[dict] = None,
+                event_context: Optional[dict] = None):
     """Score a single instrument into a SetupResult, or None if data insufficient.
 
     region is a display bucket ('Swedish' | 'International').
@@ -778,6 +841,27 @@ def score_setup(symbol, region, closes, highs, lows, *,
     macd = _macd_state(closes)
     boll = _bollinger_state(closes)
     breakout = len(closes) > 61 and price > max(closes[-61:-1])
+
+    # -- levels + timing (computed BEFORE conflicts so corporate-event windows
+    #    can feed the score; ATR risk model unchanged, explicit invalidation) --
+    entry = round(price, 2)
+    stop = round(entry - STOP_ATR_MULT * atr, 2)
+    risk = entry - stop
+    target = round(entry + REWARD_RISK * risk, 2)
+    timing = _time_to_target(closes, lows, atr, entry, target, boll, as_of,
+                             calibration=calibration)
+
+    # -- corporate-event gap risk (earnings / ex-dividend inside the window) --
+    event_conflicts, events_summary = _event_flags(
+        event_context, as_of or date.today(),
+        timing["latest_target_date"], atr)
+    if events_summary.get("earnings_in_window"):
+        # An earnings gap can render the whole window moot: cap reliability.
+        tc = min(timing["timing_confidence"], EARNINGS_TIMING_CONF_CAP)
+        timing["timing_confidence"] = round(tc, 2)
+        timing["timing_reliability"] = "medium" if tc >= 0.45 else "low"
+        timing["timing_reasoning"] += (
+            "; earnings inside the window caps timing reliability (gap risk)")
 
     # -- sub-scores (each named; raw max = 100) --
     sub: dict = {}
@@ -848,6 +932,7 @@ def score_setup(symbol, region, closes, highs, lows, *,
     ctx_conf, ctx_sup, stale_count = _context_conflicts(technical_context, price, atr)
     conflicts.extend(ctx_conf)
     supports.extend(ctx_sup)
+    conflicts.extend(event_conflicts)   # earnings / ex-dividend gap risk
 
     # -- penalties --
     pen: dict = {}
@@ -881,14 +966,9 @@ def score_setup(symbol, region, closes, highs, lows, *,
         n_conflicts=len(conflicts), data_limited=data_limited, grade=grade,
         breakout=breakout, ichi=ichi, boll=boll)
 
-    # -- levels (ATR risk model, unchanged maths, explicit invalidation) --
-    entry = round(price, 2)
-    stop = round(entry - STOP_ATR_MULT * atr, 2)
-    risk = entry - stop
-    target = round(entry + REWARD_RISK * risk, 2)
-
-    timing = _time_to_target(closes, lows, atr, entry, target, boll, as_of,
-                             calibration=calibration)
+    # A window that spans an earnings report is never better than Elevated risk.
+    if events_summary.get("earnings_in_window") and risk_level == "Moderate":
+        risk_level = "Elevated"
 
     strongest_sup = "; ".join(supports[:3]) if supports else "none - weak setup"
     strongest_opp = "; ".join(conflicts[:3]) if conflicts else "no material opposing signals detected"
@@ -928,6 +1008,7 @@ def score_setup(symbol, region, closes, highs, lows, *,
         data_quality={"daily_bars": len(closes),
                       "monthly_rsi_available": monthly_rsi is not None,
                       "weekly_rsi_available": weekly_rsi is not None},
+        events=events_summary,
         technical_context_used=technical_context is not None,
         debug={
             "raw_score": round(raw, 1),

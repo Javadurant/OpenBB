@@ -303,3 +303,71 @@ def test_ledger_logs_expected_days(tmp_path, monkeypatch):
     rec = sl._read_all()[0]
     assert rec["expected_days"] == 10
     assert rec["window_days"] == 20
+
+
+# ── Corporate-event gap risk (earnings / ex-dividend inside the window) ──────
+
+def test_earnings_inside_window_flags_penalises_and_caps_reliability():
+    from datetime import date, timedelta
+    closes, highs, lows = trend_series()
+    as_of = date(2026, 7, 8)
+    ev = {"next_earnings_date": (as_of + timedelta(days=5)).isoformat()}
+    r = score_setup("X", "Swedish", closes, highs, lows, as_of=as_of, event_context=ev)
+    plain = score_setup("X", "Swedish", closes, highs, lows, as_of=as_of)
+    assert r["events"]["earnings_in_window"] is True
+    assert any("earnings report" in c for c in r["conflicts"])
+    assert r["score"] < plain["score"]                      # conflict penalty applied
+    assert r["timing_reliability"] != "high"                # never high across earnings
+    assert "earnings inside the window" in r["timing_reasoning"]
+    assert r["risk_level"] in ("Elevated", "High", "Moderate-High")
+
+
+def test_earnings_far_outside_window_is_not_flagged():
+    from datetime import date, timedelta
+    closes, highs, lows = trend_series()
+    as_of = date(2026, 7, 8)
+    ev = {"next_earnings_date": (as_of + timedelta(days=400)).isoformat()}
+    r = score_setup("X", "Swedish", closes, highs, lows, as_of=as_of, event_context=ev)
+    plain = score_setup("X", "Swedish", closes, highs, lows, as_of=as_of)
+    assert r["events"]["earnings_in_window"] is False
+    assert not any("earnings report" in c for c in r["conflicts"])
+    assert r["score"] == plain["score"]
+    assert r["timing_reliability"] == plain["timing_reliability"]
+
+
+def test_large_ex_dividend_inside_window_is_conflict():
+    from datetime import date, timedelta
+    from api.setup_scanner import _atr
+    closes, highs, lows = trend_series()
+    as_of = date(2026, 7, 8)
+    atr = _atr(highs, lows, closes)
+    ev = {"next_ex_dividend_date": (as_of + timedelta(days=4)).isoformat(),
+          "dividend_amount": 1.0 * atr}           # a full ATR of mechanical drop
+    r = score_setup("SWED-A.ST", "Swedish", closes, highs, lows,
+                    as_of=as_of, event_context=ev)
+    assert r["events"]["ex_dividend_in_window"] is True
+    assert r["events"]["dividend_atr_ratio"] >= 0.5
+    assert any("ex-dividend" in c for c in r["conflicts"])
+
+
+def test_small_ex_dividend_is_informational_not_conflict():
+    from datetime import date, timedelta
+    from api.setup_scanner import _atr
+    closes, highs, lows = trend_series()
+    as_of = date(2026, 7, 8)
+    atr = _atr(highs, lows, closes)
+    ev = {"next_ex_dividend_date": (as_of + timedelta(days=4)).isoformat(),
+          "dividend_amount": 0.05 * atr}          # tiny dividend: flag, don't punish
+    r = score_setup("X", "Swedish", closes, highs, lows, as_of=as_of, event_context=ev)
+    assert r["events"]["ex_dividend_in_window"] is True
+    assert not any("ex-dividend" in c for c in r["conflicts"])
+
+
+def test_garbage_event_dates_degrade_silently():
+    closes, highs, lows = trend_series()
+    ev = {"next_earnings_date": "not-a-date", "next_ex_dividend_date": None,
+          "dividend_amount": float("nan")}
+    r = score_setup("X", "Swedish", closes, highs, lows, event_context=ev)
+    assert r is not None
+    assert r["events"]["earnings_in_window"] is False
+    assert r["events"]["ex_dividend_in_window"] is False

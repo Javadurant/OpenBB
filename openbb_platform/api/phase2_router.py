@@ -433,6 +433,58 @@ _SETUP_CACHE: dict[str, Any] = {"key": None, "at": 0.0, "data": None}
 _SETUP_TTL_SEC = 1800.0
 
 
+def _fetch_event_context(sym: str, asset_class: str) -> Optional[dict]:
+    """Next earnings + ex-dividend dates via yfinance calendar (best effort).
+
+    Feeds the scanner's corporate-event gap-risk checks: an earnings report or
+    a chunky ex-dividend inside the target window is a conflict a stop cannot
+    protect against. Crypto/commodity futures have neither - skipped. Any
+    fetch/shape failure degrades to None (the scan never blocks on this)."""
+    if asset_class not in ("equity", "etf", "fund"):
+        return None
+    try:
+        from datetime import date as _d, datetime as _dt
+        import yfinance as yf
+
+        def _norm(v) -> Optional[_d]:
+            if isinstance(v, _dt):
+                return v.date()
+            if isinstance(v, _d):
+                return v
+            return None
+
+        t = yf.Ticker(sym)
+        try:
+            cal = t.calendar or {}
+        except Exception:  # noqa: BLE001 - some tickers have no calendar
+            cal = {}
+        if not isinstance(cal, dict):
+            cal = {}
+        today = _d.today()
+        out: dict = {}
+
+        eds = cal.get("Earnings Date") or []
+        if not isinstance(eds, (list, tuple)):
+            eds = [eds]
+        future = [d for d in (_norm(e) for e in eds) if d is not None and d >= today]
+        if future:
+            out["next_earnings_date"] = min(future).isoformat()
+
+        xd = _norm(cal.get("Ex-Dividend Date"))
+        if xd is not None and xd >= today:
+            out["next_ex_dividend_date"] = xd.isoformat()
+            try:
+                divs = t.dividends
+                if divs is not None and len(divs):
+                    out["dividend_amount"] = float(divs.iloc[-1])
+            except Exception:  # noqa: BLE001 - amount is optional
+                pass
+        return out or None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("event context skipped for %s: %s", sym, exc)
+        return None
+
+
 def _fetch_and_score(entry: tuple[str, str, str],
                      calibration: Optional[dict] = None) -> Optional[dict]:
     """Fetch 1y daily history for one (symbol, region, asset_class) and score it."""
@@ -483,6 +535,7 @@ def _fetch_and_score(entry: tuple[str, str, str],
             technical_context=tech_ctx,          # v3: harmonic conflicts enter the score
             proxy_note=_PROXY_META.get(sym),     # v3: honest proxy labelling
             calibration=calibration,             # v3: ledger-based timing calibration
+            event_context=_fetch_event_context(sym, asset_class),  # earnings/ex-div gap risk
         )
         if r is not None:
             # <- NEW [Phase3-Step1]: stamp provenance (council mandate: source + as_of on every series)
