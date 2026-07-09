@@ -58,12 +58,13 @@ SECONDS_PER_DAY:      Final = 86_400.0
 # ── Output contracts ──────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class DataPoint:
-    """One normalized OHLC bar (or NAV point with o=h=l=c)."""
+    """One normalized OHLC(V) bar (or NAV point with o=h=l=c, volume 0)."""
     ts:    datetime
     open:  float
     high:  float
     low:   float
     close: float
+    volume: float = 0.0   # v3.2: real volume ingestion (0.0 = not provided)
 
     def is_finite(self) -> bool:
         return all(math.isfinite(x) for x in (self.open, self.high, self.low, self.close))
@@ -83,6 +84,11 @@ class PriceSeries:
     @property
     def closes(self) -> list[float]:
         return [p.close for p in self.points]
+
+    @property
+    def volumes(self) -> list[float]:
+        """Per-bar volumes; all-zero when the provider has none (funds/macro)."""
+        return [p.volume for p in self.points]
 
     @property
     def staleness_days(self) -> float:
@@ -147,10 +153,15 @@ class YahooFinanceProvider(BaseProvider):
             ts = idx.to_pydatetime()
             if ts.tzinfo is None:
                 ts = ts.replace(tzinfo=timezone.utc)
+            try:
+                vol = float(row.get("Volume", 0) or 0)
+            except (TypeError, ValueError):
+                vol = 0.0
             pts.append(DataPoint(
                 ts=ts,
                 open=float(row["Open"]), high=float(row["High"]),
                 low=float(row["Low"]),  close=float(row["Close"]),
+                volume=vol,
             ))
         return pts
 
@@ -229,7 +240,12 @@ class EODHDProvider(BaseProvider):
                 lo = float(row.get("low") or close)
                 if o <= EPS or hi <= EPS or lo <= EPS:
                     o = hi = lo = close
-                pts.append(DataPoint(ts=ts, open=o, high=hi, low=lo, close=close))
+                try:
+                    vol = float(row.get("volume") or 0)
+                except (TypeError, ValueError):
+                    vol = 0.0
+                pts.append(DataPoint(ts=ts, open=o, high=hi, low=lo, close=close,
+                                     volume=vol))
             except (KeyError, TypeError, ValueError):
                 continue
         if len(pts) < MIN_POINTS:

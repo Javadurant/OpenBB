@@ -449,6 +449,66 @@ _SETUP_CACHE: dict[str, Any] = {"key": None, "at": 0.0, "data": None}
 _SETUP_TTL_SEC = 1800.0
 
 
+def _market_regime_map() -> dict[str, Optional[dict]]:
+    """Scan-level market-regime gate: OMXS30 for the Swedish box, S&P 500 for
+    the International box, each vs its 200-day MA. The most common and
+    best-tested systematic filter - bullish setups in a risk-off tape are
+    DOWNGRADED (conflict + A-grade cap), never hidden. Best effort per index."""
+    out: dict[str, Optional[dict]] = {}
+    try:
+        import yfinance as yf
+        for region, idx in (("Swedish", "^OMX"), ("International", "^GSPC")):
+            try:
+                h = yf.Ticker(idx).history(period="2y")
+                c = [float(x) for x in h["Close"]]
+                if len(c) < 200:
+                    out[region] = None
+                    continue
+                ma200 = sum(c[-200:]) / 200
+                out[region] = {"index": idx, "close": round(c[-1], 2),
+                               "ma200": round(ma200, 2),
+                               "risk_on": c[-1] > ma200}
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("market regime %s: %s", idx, exc)
+                out[region] = None
+    except Exception:  # noqa: BLE001
+        out = {"Swedish": None, "International": None}
+    return out
+
+
+def _news_context(sym: str, limit: int = 8) -> Optional[dict]:
+    """Recency-aware news context for a SELECTED setup (finalists only - never
+    per-candidate, to respect rate limits). yfinance provides no sentiment, so
+    sentiment is honestly 'not scored'; recency and volume of coverage are real."""
+    try:
+        from datetime import datetime, timezone
+        import yfinance as yf
+        items = yf.Ticker(sym).news or []
+        now = datetime.now(timezone.utc)
+        recent = []
+        for it in items[:limit]:
+            content = it.get("content") or it
+            ts = content.get("pubDate") or content.get("providerPublishTime")
+            title = (content.get("title") or "").strip()
+            age_days = None
+            try:
+                if isinstance(ts, (int, float)):
+                    age_days = (now - datetime.fromtimestamp(ts, timezone.utc)).days
+                elif isinstance(ts, str):
+                    age_days = (now - datetime.fromisoformat(ts.replace("Z", "+00:00"))).days
+            except (ValueError, TypeError, OSError):
+                pass
+            if title:
+                recent.append({"title": title[:120], "age_days": age_days})
+        last7 = sum(1 for r in recent if r["age_days"] is not None and r["age_days"] <= 7)
+        return {"headlines": recent[:4], "count_7d": last7,
+                "latest_age_days": (recent[0]["age_days"] if recent else None),
+                "sentiment": "not scored (no licensed sentiment feed)"}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("news context %s: %s", sym, exc)
+        return None
+
+
 def _fetch_event_context(sym: str, asset_class: str) -> Optional[dict]:
     """Next earnings + ex-dividend dates via yfinance calendar (best effort).
 
@@ -502,7 +562,8 @@ def _fetch_event_context(sym: str, asset_class: str) -> Optional[dict]:
 
 
 def _fetch_and_score(entry: tuple[str, str, str],
-                     calibration: Optional[dict] = None) -> Optional[dict]:
+                     calibration: Optional[dict] = None,
+                     regime_map: Optional[dict] = None) -> Optional[dict]:
     """Fetch 1y daily history for one (symbol, region, asset_class) and score it."""
     import asyncio
     from .data_ingestion import service as _ingest, DataMissingException  # <- NEW [Phase3-Step1]: ingestion backbone
@@ -532,6 +593,7 @@ def _fetch_and_score(entry: tuple[str, str, str],
         name = sym
         div_yield = None
         sector = None
+        fundamentals = None
         if asset_class not in _NO_INFO_CLASSES:
             try:
                 from pages.ai_trading_agent import _fetch_info
@@ -539,6 +601,12 @@ def _fetch_and_score(entry: tuple[str, str, str],
                 name = info.get("name", sym)
                 div_yield = info.get("dividend_yield")
                 sector = info.get("sector")
+                # v3.2: fundamentals sub-score (small, supports-only weight)
+                fund = {k: info.get(k) for k in
+                        ("pe_trailing", "pe_forward", "roe",
+                         "revenue_growth", "earnings_growth")}
+                if any(v is not None for v in fund.values()):
+                    fundamentals = fund
             except Exception:
                 pass
 
@@ -552,11 +620,18 @@ def _fetch_and_score(entry: tuple[str, str, str],
             proxy_note=_PROXY_META.get(sym),     # v3: honest proxy labelling
             calibration=calibration,             # v3: ledger-based timing calibration
             event_context=_fetch_event_context(sym, asset_class),  # earnings/ex-div gap risk
+            volumes=series.volumes,              # v3.2: real volume ingestion
+            market_regime=(regime_map or {}).get(region),   # v3.2: index regime gate
+            fundamentals=fundamentals,           # v3.2: fundamentals sub-score
         )
         if r is not None:
             # <- NEW [Phase3-Step1]: stamp provenance (council mandate: source + as_of on every series)
             r["source"] = series.source
             r["as_of"] = series.as_of.date().isoformat()
+            # v3.2: FX exposure flag for Swedish-accessible non-SEK proxies
+            if region == "Swedish" and not sym.upper().endswith(".ST"):
+                r["fx_note"] = ("Priced in a foreign currency — SEK investors "
+                                "carry FX exposure on top of the instrument's move.")
             resolved = series.meta.get("resolved", sym)
             if resolved != sym:
                 r["resolved_symbol"] = resolved
@@ -581,7 +656,7 @@ def setup_of_the_day(refresh: bool = False) -> dict[str, Any]:
     Decision-support, not advice. Every level computed from live OHLCV;
     target is an ATR time WINDOW, never a hard date. v1 = "as of last close".
     """
-    cache_key = "setup_v3"
+    cache_key = "setup_v3.2"
     now = _time.time()
     if (not refresh and _SETUP_CACHE["data"] is not None
             and _SETUP_CACHE["key"] == cache_key
@@ -599,10 +674,14 @@ def setup_of_the_day(refresh: bool = False) -> dict[str, Any]:
         logger.warning("timing calibration unavailable", exc_info=True)
         calibration = None
 
+    # v3.2: scan-level market-regime gate (OMXS30 / S&P 500 vs 200-day MA).
+    regime_map = _market_regime_map()
+
     # Parallel fetch+score across the whole tagged universe.
     scored: list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = {pool.submit(_fetch_and_score, e, calibration): e for e in SETUP_UNIVERSE}
+        futs = {pool.submit(_fetch_and_score, e, calibration, regime_map): e
+                for e in SETUP_UNIVERSE}
         for fut in as_completed(futs):
             r = fut.result()
             if r is not None:
@@ -647,6 +726,9 @@ def setup_of_the_day(refresh: bool = False) -> dict[str, Any]:
                 "biggest_strength": m.get("strongest_supporting"),
                 "biggest_weakness": m.get("strongest_opposing"),
             } for i, m in enumerate(members)]
+            # v3.2: news context for the SELECTED setup only (rate-limit safe).
+            if top is not None and ac not in ("gold", "oil", "copper", "silver"):
+                top["news"] = _news_context(top["symbol"])
             boxes[region][ac] = {
                 "top_setup":   top,
                 "has_quality": has_quality,
@@ -672,6 +754,7 @@ def setup_of_the_day(refresh: bool = False) -> dict[str, Any]:
         "status":      "ok",
         "as_of":       "latest close (crypto: 24/7)",
         "cached":      False,
+        "market_regime": regime_map,   # v3.2: scan-level index regime
         "boxes":       boxes,
         "total_scored": len(scored),
     }

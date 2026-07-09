@@ -385,10 +385,14 @@ def test_compliance_matrix_present_and_honest():
               "atr", "fib_time_zones", "fib_circles",
               "tax_note_excluded_from_score"):
         assert c[k] is True, f"compliance[{k}] should be True"
-    # known-unimplemented components must report honest False
-    for k in ("volume", "andrews_pitchfork", "support_resistance_levels",
-              "fundamentals_in_score", "news_in_score", "market_regime_filter"):
+    # components whose data was NOT provided must report honest False
+    for k in ("volume", "fundamentals_in_score", "news_in_score",
+              "market_regime_filter"):
         assert c[k] is False, f"compliance[{k}] must be honest False"
+    # v3.2 structural components report whether they actually computed
+    for k in ("andrews_pitchfork", "support_resistance_levels",
+              "fib_price_clusters", "liquidity_screen"):
+        assert k in c
     # context-dependent flags reflect what was passed
     assert c["harmonics_consulted"] is False
     r2 = score_setup("X", "Swedish", closes, highs, lows,
@@ -475,3 +479,112 @@ def test_skf_regression_pullback_not_reversal():
     assert r1["risk_level"] in ("Elevated", "High", "Moderate-High")
     # full transparency: sub-scores + penalties + compliance always present
     assert r1["sub_scores"] and r1["penalties"] and r1["compliance"]
+
+
+# ── v3.2: regime, volume, S/R, fib price, pitchfork, calendars, liquidity ────
+
+def test_add_trading_days_skips_swedish_holidays():
+    from datetime import date
+    from api.setup_scanner import _add_trading_days, SWEDISH_HOLIDAYS
+    # Good Friday 2026-04-03 and Easter Monday 2026-04-06 are skipped
+    assert _add_trading_days(date(2026, 4, 1), 2, SWEDISH_HOLIDAYS) == date(2026, 4, 7)
+    # crypto: plain calendar days, weekends included
+    assert _add_trading_days(date(2026, 4, 1), 2, calendar_days=True) == date(2026, 4, 3)
+
+
+def test_crypto_windows_use_calendar_days():
+    from datetime import date, timedelta
+    closes, highs, lows = trend_series()
+    as_of = date(2026, 7, 10)   # a Friday
+    r = score_setup("BTC-USD", "International", closes, highs, lows,
+                    asset_class="crypto", as_of=as_of)
+    exp = r["expected_trading_days"]
+    assert r["base_case_target_date"] == (as_of + timedelta(days=exp)).isoformat()
+    assert "24/7" in r["expected_target_time"]
+
+
+def test_volume_state_math():
+    from api.setup_scanner import _volume_state, W_VOLUME
+    flat = [1000.0] * 30
+    burst = flat[:-1] + [1600.0]                      # 1.6x the 20d average
+    assert _volume_state(burst, breakout=True)["earned"] == W_VOLUME
+    assert _volume_state([0.0] * 30, breakout=False) is None   # no data = None
+    assert _volume_state(flat[:10], breakout=False) is None    # too short
+    quiet = flat[:-1] + [500.0]
+    assert _volume_state(quiet, breakout=False)["earned"] == 0.0
+
+
+def test_support_resistance_math():
+    from api.setup_scanner import _support_resistance, W_SR
+    piv = [(0, 90.0), (10, 110.0), (20, 95.0), (30, 108.0)]
+    # price 100, atr 2: support 95 (2.5 ATR below), resistance 108 (4 ATR above)
+    sr = _support_resistance(piv, 100.0, 2.0, target=106.0)
+    assert sr["support"] == 95.0 and sr["resistance"] == 108.0
+    assert sr["earned"] == W_SR          # support near + clean air to target
+    # resistance 1 ATR overhead, before target -> conflict, half score
+    sr2 = _support_resistance(piv, 106.5, 2.0, target=112.0)
+    assert sr2["conflict"] is not None and "resistance" in sr2["conflict"]
+
+
+def test_fib_price_levels_math():
+    from api.setup_scanner import _fib_price_levels
+    piv = [(0, 100.0), (20, 120.0)]                  # up-leg 100 -> 120
+    f = _fib_price_levels(piv, 115.0, 2.0, target=125.4)
+    assert f["retracements"][0.5] == 110.0
+    assert f["extensions"][1.272] == 125.44
+    assert any("1.272" in n for n in f["notes"])     # target clusters with ext
+    assert f["earned"] >= 2.0
+
+
+def test_pitchfork_math_and_staleness():
+    from api.setup_scanner import _pitchfork_state, W_PITCHFORK
+    piv = [(0, 100.0), (20, 120.0), (40, 110.0)]
+    # median line: from P0 through midpoint(30, 115) -> slope 0.5/bar
+    pf = _pitchfork_state(piv, price=140.0, atr=2.0, last_idx=60)
+    assert pf["stale"] is False and pf["rising"] is True
+    assert pf["median"] == 130.0                     # 100 + 0.5 * 60
+    assert pf["earned"] == W_PITCHFORK               # above rising median
+    stale = _pitchfork_state([(0, 100.0), (20, 120.0), (40, 110.0)],
+                             price=140.0, atr=2.0, last_idx=300)
+    assert stale["stale"] is True and "earned" not in stale
+
+
+def test_fundamentals_earned_supports_only():
+    from api.setup_scanner import _fundamentals_earned, W_FUND
+    full, notes = _fundamentals_earned({"revenue_growth": 0.08, "earnings_growth": 0.1,
+                                        "roe": 0.22, "pe_trailing": 15.0})
+    assert full == W_FUND and len(notes) == 4
+    none_, notes2 = _fundamentals_earned({"revenue_growth": -0.05, "pe_trailing": 80.0})
+    assert none_ == 0.0
+
+
+def test_market_regime_risk_off_penalises_and_caps():
+    closes, highs, lows = trend_series()
+    on = score_setup("X", "Swedish", closes, highs, lows,
+                     market_regime={"index": "^OMX", "risk_on": True})
+    off = score_setup("X", "Swedish", closes, highs, lows,
+                      market_regime={"index": "^OMX", "risk_on": False})
+    assert off["score"] < on["score"]
+    assert any("risk-off" in c for c in off["conflicts"])
+    assert off["compliance"]["market_regime_filter"] is True
+    assert off["grade"] != "A"                       # A-grade cap in a risk-off tape
+
+
+def test_dynamic_normalization_ignores_missing_components():
+    closes, highs, lows = trend_series()
+    no_vol = score_setup("X", "Swedish", closes, highs, lows, volumes=None)
+    zero_vol = score_setup("X", "Swedish", closes, highs, lows, volumes=[0.0] * len(closes))
+    assert no_vol["score"] == zero_vol["score"]      # all-zero volume = not provided
+    assert "volume" not in no_vol["sub_scores_max"]
+    assert no_vol["compliance"]["volume"] is False
+
+
+def test_liquidity_penalty_for_thin_turnover():
+    closes, highs, lows = trend_series()
+    thin = [10.0] * len(closes)                      # ~2k turnover: very thin
+    r = score_setup("THIN.ST", "Swedish", closes, highs, lows, volumes=thin)
+    assert r["penalties"]["liquidity_penalty"] > 0
+    assert r["liquidity_turnover_20d"] is not None
+    deep = [1_000_000.0] * len(closes)
+    r2 = score_setup("DEEP.ST", "Swedish", closes, highs, lows, volumes=deep)
+    assert r2["penalties"]["liquidity_penalty"] == 0.0

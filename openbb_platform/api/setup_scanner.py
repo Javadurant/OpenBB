@@ -129,6 +129,44 @@ FAR_PRZ_ATR:       Final = 3.0   # bullish pattern D beyond this = irrelevant, n
 EXDIV_CONFLICT_ATR:       Final = 0.5    # dividend >= 0.5 ATR inside window = conflict
 EARNINGS_TIMING_CONF_CAP: Final = 0.60   # earnings in window: reliability <= "medium"
 
+# -- v3.2 components (regime, volume, S/R, fib price, pitchfork, fundamentals) --
+# Scores use DYNAMIC normalization: only components whose data exists enter the
+# denominator, so a fund without volume is not silently penalised for it.
+W_VOLUME:           Final = 4.0
+W_SR:               Final = 4.0
+W_FIBP:             Final = 3.0
+W_PITCHFORK:        Final = 3.0
+W_FUND:             Final = 4.0   # supports selection, can never rescue bad structure
+W_REGIME:           Final = 4.0
+VOL_BREAKOUT_MULT:  Final = 1.5   # breakout bar needs >= 1.5x 20-day average volume
+SR_SUPPORT_ATR:     Final = 3.0   # pivot support within 3 ATR below = "support beneath"
+SR_RESIST_NEAR_ATR: Final = 1.0   # pivot resistance within 1 ATR above = conflict
+FIB_RETR:           Final = (0.382, 0.5, 0.618)
+FIB_EXT:            Final = (1.272, 1.618)   # extensions of the last up-leg from its low
+FIB_CLUSTER_ATR:    Final = 0.5   # levels within 0.5 ATR count as a cluster
+PITCHFORK_MAX_AGE:  Final = 250   # P0 older than this (bars) = stale fork, not scored
+LIQ_MIN_TURNOVER:   Final = 1_000_000.0   # 20d avg turnover below this = thin (curr. units)
+LIQ_PENALTY:        Final = 3.0
+
+# Exchange holiday calendars for target-date math (VERIFY ANNUALLY - these are
+# configurable constants, not an astronomical calendar service). Crypto uses
+# plain calendar days (trades 7d/week).
+SWEDISH_HOLIDAYS: Final = frozenset({
+    date(2026, 1, 1), date(2026, 1, 6), date(2026, 4, 3), date(2026, 4, 6),
+    date(2026, 5, 1), date(2026, 5, 14), date(2026, 6, 19),
+    date(2026, 12, 24), date(2026, 12, 25), date(2026, 12, 31),
+    date(2027, 1, 1), date(2027, 1, 6), date(2027, 3, 26), date(2027, 3, 29),
+    date(2027, 5, 6), date(2027, 6, 18), date(2027, 12, 24), date(2027, 12, 31),
+})
+US_HOLIDAYS: Final = frozenset({
+    date(2026, 1, 1), date(2026, 1, 19), date(2026, 2, 16), date(2026, 4, 3),
+    date(2026, 5, 25), date(2026, 6, 19), date(2026, 7, 3), date(2026, 9, 7),
+    date(2026, 11, 26), date(2026, 12, 25),
+    date(2027, 1, 1), date(2027, 1, 18), date(2027, 2, 15), date(2027, 3, 26),
+    date(2027, 5, 31), date(2027, 6, 18), date(2027, 7, 5), date(2027, 9, 6),
+    date(2027, 11, 25), date(2027, 12, 24),
+})
+
 DIVIDEND_KF_THRESHOLD: Final = 2.0
 TAX_FREE_FLOOR_2026:   Final = 300_000
 
@@ -391,14 +429,157 @@ def _ichimoku_state(highs: list, lows: list, closes: list, atr: float) -> Option
 # Timing model v2 - earliest / base / latest windows with confluence grading
 # ============================================================================
 
-def _add_trading_days(start: date, n: int) -> date:
-    """start + n weekdays (holiday calendars are a documented v4 refinement)."""
+def _add_trading_days(start: date, n: int, holidays: frozenset = frozenset(),
+                      calendar_days: bool = False) -> date:
+    """start + n trading days, skipping weekends AND exchange holidays.
+    calendar_days=True (crypto, trades 7d/week) adds plain calendar days."""
+    if calendar_days:
+        return start + timedelta(days=n)
     d, added = start, 0
     while added < n:
         d += timedelta(days=1)
-        if d.weekday() < 5:
+        if d.weekday() < 5 and d not in holidays:
             added += 1
     return d
+
+
+def _volume_state(volumes: Optional[list], breakout: bool) -> Optional[dict]:
+    """Volume confirmation: breakout expansion / 5-day trend vs 20-day average.
+    Returns None when the provider supplied no usable volume (funds, NAV)."""
+    if not volumes or len(volumes) < 25:
+        return None
+    v20 = sum(volumes[-21:-1]) / 20
+    if v20 <= EPS:
+        return None   # all-zero series: provider has no volume for this instrument
+    last = volumes[-1]
+    recent5 = sum(volumes[-5:]) / 5
+    notes: list = []
+    if breakout and last >= VOL_BREAKOUT_MULT * v20:
+        earned = W_VOLUME
+        notes.append(f"breakout on {last / v20:.1f}x average volume")
+    elif recent5 > v20:
+        earned = W_VOLUME * 0.75
+        notes.append("5-day volume running above the 20-day average")
+    elif last > v20:
+        earned = W_VOLUME * 0.5
+        notes.append("latest volume above the 20-day average")
+    else:
+        earned = 0.0
+        notes.append("volume below average - no participation confirmation")
+    return {"earned": earned, "avg_20d": v20, "last": last, "notes": notes}
+
+
+def _support_resistance(pivots: list, price: float, atr: float,
+                        target: float) -> Optional[dict]:
+    """Nearest pivot support below / resistance above price, in ATR units.
+    Support beneath the candles earns; near overhead resistance before the
+    target is a conflict (the target must clear real structure)."""
+    if len(pivots) < 2 or atr <= EPS:
+        return None
+    levels = [p for _, p in pivots]
+    sups = [p for p in levels if p < price - EPS]
+    ress = [p for p in levels if p > price + EPS]
+    support = max(sups) if sups else None
+    resistance = min(ress) if ress else None
+    earned = 0.0
+    conflict = None
+    if support is not None and (price - support) / atr <= SR_SUPPORT_ATR:
+        earned += W_SR / 2
+    if resistance is None or resistance >= target - EPS:
+        earned += W_SR / 2   # clean air to the target
+    elif (resistance - price) / atr <= SR_RESIST_NEAR_ATR:
+        conflict = (f"overhead pivot resistance ~{resistance:.2f} within "
+                    f"{SR_RESIST_NEAR_ATR:.0f} ATR, before the target")
+    return {"earned": earned, "support": support, "resistance": resistance,
+            "support_dist_atr": round((price - support) / atr, 2) if support else None,
+            "resistance_dist_atr": round((resistance - price) / atr, 2) if resistance else None,
+            "conflict": conflict}
+
+
+def _fib_price_levels(pivots: list, price: float, atr: float,
+                      target: float) -> Optional[dict]:
+    """Fibonacci PRICE tools from the most recent up-leg (pivot low -> high):
+    retracements as support confluence, extensions as target clusters."""
+    if len(pivots) < 2 or atr <= EPS:
+        return None
+    leg = None
+    for i in range(len(pivots) - 1, 0, -1):
+        lo_p, hi_p = pivots[i - 1][1], pivots[i][1]
+        if hi_p > lo_p:
+            leg = (lo_p, hi_p)
+            break
+    if leg is None:
+        return None
+    lo_p, hi_p = leg
+    rng = hi_p - lo_p
+    retr = {r: round(hi_p - r * rng, 2) for r in FIB_RETR}
+    ext = {k: round(lo_p + k * rng, 2) for k in FIB_EXT}
+    earned, notes = 0.0, []
+    aligned = [k for k, v in ext.items() if abs(v - target) <= FIB_CLUSTER_ATR * atr]
+    if aligned:
+        earned += 2.0
+        notes.append(f"target clusters with the {aligned[0]} fib extension ({ext[aligned[0]]})")
+    beneath = [(r, v) for r, v in retr.items()
+               if 0 < (price - v) <= 2 * FIB_CLUSTER_ATR * atr]
+    if beneath:
+        earned += 1.0
+        notes.append(f"fib {beneath[0][0]} retracement support {beneath[0][1]} beneath price")
+    return {"earned": min(earned, W_FIBP), "retracements": retr,
+            "extensions": ext, "notes": notes}
+
+
+def _pitchfork_state(pivots: list, price: float, atr: float,
+                     last_idx: int) -> Optional[dict]:
+    """Andrews Pitchfork from the last three pivots (P0 handle, P1/P2 tines):
+    median line from P0 through midpoint(P1,P2), parallels through P1/P2.
+    A fork whose handle is older than PITCHFORK_MAX_AGE bars is STALE and
+    excluded from scoring (anchor-staleness requirement)."""
+    if len(pivots) < 3 or atr <= EPS:
+        return None
+    (i0, p0), (i1, p1), (i2, p2) = pivots[-3], pivots[-2], pivots[-1]
+    age = last_idx - i0
+    mid_i, mid_p = (i1 + i2) / 2.0, (p1 + p2) / 2.0
+    if mid_i - i0 < 1:
+        return None
+    if age > PITCHFORK_MAX_AGE:
+        return {"stale": True, "age_bars": age}
+    slope = (mid_p - p0) / (mid_i - i0)
+    ml = p0 + slope * (last_idx - i0)
+    half = abs(p1 - (p0 + slope * (i1 - i0)))
+    upper, lower = ml + half, ml - half
+    rising = slope > EPS
+    earned, notes, conflict = 0.0, [], None
+    if rising and price >= ml:
+        earned = W_PITCHFORK
+        notes.append("price holding above the median line of a rising pitchfork")
+    elif rising and price >= lower:
+        earned = W_PITCHFORK / 2
+        notes.append("price in the lower half of a rising pitchfork (median-line magnet above)")
+    elif price < lower:
+        conflict = "price below the lower parallel of the pitchfork"
+    return {"stale": False, "age_bars": age, "median": round(ml, 2),
+            "upper": round(upper, 2), "lower": round(lower, 2),
+            "slope_per_bar": round(slope, 4), "rising": rising,
+            "earned": earned, "notes": notes, "conflict": conflict}
+
+
+def _fundamentals_earned(f: dict) -> tuple:
+    """Fundamental quality: up to W_FUND points (growth, profitability, sane
+    valuation). Deliberately small - fundamentals SUPPORT a technical setup,
+    they never rescue a broken structure."""
+    earned, notes = 0.0, []
+    rg, eg = f.get("revenue_growth"), f.get("earnings_growth")
+    roe = f.get("roe")
+    pe = f.get("pe_trailing") or f.get("pe_forward")
+    if isinstance(rg, (int, float)) and math.isfinite(rg) and rg > 0:
+        earned += 1.0; notes.append(f"revenue growth {rg * 100:.1f}%")
+    if isinstance(eg, (int, float)) and math.isfinite(eg) and eg > 0:
+        earned += 1.0; notes.append(f"earnings growth {eg * 100:.1f}%")
+    if isinstance(roe, (int, float)) and math.isfinite(roe) and roe > 0.10:
+        earned += 1.0; notes.append(f"ROE {roe * 100:.0f}%")
+    if isinstance(pe, (int, float)) and math.isfinite(pe) and 0 < pe < 40:
+        earned += 1.0; notes.append(f"P/E {pe:.1f}")
+    return earned, notes
 
 
 def _pivot_low_index(lows: list, lookback: int = 180) -> int:
@@ -455,7 +636,9 @@ def _time_to_target(closes: list, lows: list, atr: float, entry: float,
                     target: float, boll: Optional[dict],
                     as_of: Optional[date],
                     calibration: Optional[dict] = None,
-                    highs: Optional[list] = None) -> dict:
+                    highs: Optional[list] = None,
+                    holidays: frozenset = frozenset(),
+                    calendar_days: bool = False) -> dict:
     """Estimate trading-day windows to target from ATR distance + realised speed,
     then cross-check against Fib Time Zones and Ichimoku time numbers counted
     from the anchor pivot. Confluence NUDGES the base case (<= TIMING_SNAP_TOL)
@@ -547,15 +730,20 @@ def _time_to_target(closes: list, lows: list, atr: float, entry: float,
     reliability = "high" if conf >= 0.65 else "medium" if conf >= 0.45 else "low"
 
     today = as_of or date.today()
+
+    def _d(n: int) -> str:
+        return _add_trading_days(today, n, holidays, calendar_days).isoformat()
+
     return {
         "min_trading_days": earliest,
         "expected_trading_days": expected,
         "max_trading_days": latest,
-        "earliest_target_date": _add_trading_days(today, earliest).isoformat(),
-        "base_case_target_date": _add_trading_days(today, expected).isoformat(),
-        "latest_target_date": _add_trading_days(today, latest).isoformat(),
-        "expected_target_date": _add_trading_days(today, expected).isoformat(),
-        "expected_target_time": "market close (end-of-day estimate; daily data only)",
+        "earliest_target_date": _d(earliest),
+        "base_case_target_date": _d(expected),
+        "latest_target_date": _d(latest),
+        "expected_target_date": _d(expected),
+        "expected_target_time": ("end of day (crypto trades 24/7)" if calendar_days
+                                 else "market close (end-of-day estimate; daily data only)"),
         "timing_confidence": round(conf, 2),
         "timing_reliability": reliability,
         "timing_reasoning": "; ".join(reasons),
@@ -696,9 +884,27 @@ def build_technical_context(highs: list, lows: list, closes: list,
     except Exception:  # noqa: BLE001 - engine optional at scan time
         return None
     try:
-        pivots = zigzag_pivots(highs, lows, atr)
+        # Pivot-basis PARITY with the symbol page: prefer the same
+        # engine.structure.swings pivots the pipeline uses for its harmonic
+        # report (find_pivots + enforce_alternation); ATR-ZigZag is the
+        # fallback when the engine module is unavailable.
+        pivots: list = []
+        basis = "zigzag-atr"
+        try:
+            import pandas as pd
+            from engine.structure.swings import enforce_alternation, find_pivots
+            _df = pd.DataFrame({"high": highs, "low": lows, "close": closes})
+            _pv = enforce_alternation(find_pivots(_df))
+            if _pv is not None and len(_pv) >= 4:
+                pivots = list(zip((int(i) for i in _pv.index),
+                                  (float(x) for x in _pv["close"])))[-12:]
+                basis = "engine-swings"
+        except Exception:  # noqa: BLE001 - parity is best-effort
+            pivots = []
+        if not pivots:
+            pivots = zigzag_pivots(highs, lows, atr)
         if len(pivots) < 4:
-            return {"harmonics": []}
+            return {"harmonics": [], "pivot_basis": basis}
         prices = [p for _, p in pivots]
         idxs = [i for i, _ in pivots]
         found = HarmonicEngine().scan(prices)
@@ -714,7 +920,7 @@ def build_technical_context(highs: list, lows: list, closes: list,
                 "d_price": float(d_price),
                 "age_bars": (len(closes) - 1) - d_idx,
             })
-        ctx: dict = {"harmonics": out}
+        ctx: dict = {"harmonics": out, "pivot_basis": basis}
         ell = _elliott_context(highs, lows, closes, symbol)
         if ell is not None:
             ctx["elliott"] = ell
@@ -847,7 +1053,10 @@ def score_setup(symbol, region, closes, highs, lows, *,
                 technical_context: Optional[dict] = None,
                 proxy_note: Optional[str] = None,
                 calibration: Optional[dict] = None,
-                event_context: Optional[dict] = None):
+                event_context: Optional[dict] = None,
+                volumes: Optional[list] = None,
+                market_regime: Optional[dict] = None,
+                fundamentals: Optional[dict] = None):
     """Score a single instrument into a SetupResult, or None if data insufficient.
 
     region is a display bucket ('Swedish' | 'International').
@@ -918,8 +1127,25 @@ def score_setup(symbol, region, closes, highs, lows, *,
     stop = round(entry - STOP_ATR_MULT * atr, 2)
     risk = entry - stop
     target = round(entry + REWARD_RISK * risk, 2)
+
+    # Exchange calendar for target-date math (crypto trades 7 days/week).
+    if asset_class == "crypto":
+        cal_days, hols = True, frozenset()
+    elif symbol.upper().endswith(".ST"):
+        cal_days, hols = False, SWEDISH_HOLIDAYS
+    else:
+        cal_days, hols = False, US_HOLIDAYS
+
     timing = _time_to_target(closes, lows, atr, entry, target, boll, as_of,
-                             calibration=calibration, highs=highs)
+                             calibration=calibration, highs=highs,
+                             holidays=hols, calendar_days=cal_days)
+
+    # -- shared structural pivots for S/R, fib price clusters and pitchfork --
+    pivots = zigzag_pivots(highs, lows, atr, max_pivots=12)
+    sr = _support_resistance(pivots, price, atr, target)
+    fibp = _fib_price_levels(pivots, price, atr, target)
+    pf = _pitchfork_state(pivots, price, atr, len(closes) - 1)
+    vol_state = _volume_state(volumes, breakout)
 
     # -- corporate-event gap risk (earnings / ex-dividend inside the window) --
     event_conflicts, events_summary = _event_flags(
@@ -933,32 +1159,66 @@ def score_setup(symbol, region, closes, highs, lows, *,
         timing["timing_reasoning"] += (
             "; earnings inside the window caps timing reliability (gap risk)")
 
-    # -- sub-scores (each named; raw max = 100) --
+    # -- sub-scores: DYNAMIC normalization. Each component enters the ledger
+    #    with (earned, max); the final score is 100 * sum(earned)/sum(max) over
+    #    the components whose data EXISTS, so instruments without volume or
+    #    fundamentals are compared fairly, never silently penalised. --
     sub: dict = {}
-    sub["trend_alignment"] = aligned * W_ALIGNMENT
+    sub_max: dict = {}
+
+    def _comp(name_: str, earned_: float, max_: float) -> None:
+        sub[name_] = earned_
+        sub_max[name_] = max_
+
+    _comp("trend_alignment", aligned * W_ALIGNMENT, 3 * W_ALIGNMENT)
     if 0 <= extended_atr <= PULLBACK_ATR_MULT:
-        sub["entry_zone"] = W_ENTRY_PULLBACK
+        entry_earned = W_ENTRY_PULLBACK
     elif PULLBACK_ATR_MULT < extended_atr <= EXTENDED_ATR_MULT:
-        sub["entry_zone"] = W_ENTRY_MID
+        entry_earned = W_ENTRY_MID
     elif extended_atr > EXTENDED_ATR_MULT:
-        sub["entry_zone"] = 0.0
+        entry_earned = 0.0
     else:
-        sub["entry_zone"] = W_ENTRY_BELOW
-    sub["daily_rsi"] = W_RSI_BAND if RSI_ENTRY_LOW <= rsi <= RSI_ENTRY_HIGH else \
-        (1.0 if rsi > RSI_ENTRY_HIGH else 0.0)
-    sub["ma100"] = W_MA100 if (above_ma100 and ma100_rising) else \
-        (W_MA100 / 2 if above_ma100 else 0.0)
-    sub["ichimoku"] = 0.0
+        entry_earned = W_ENTRY_BELOW
+    _comp("entry_zone", entry_earned, W_ENTRY_PULLBACK)
+    _comp("daily_rsi",
+          W_RSI_BAND if RSI_ENTRY_LOW <= rsi <= RSI_ENTRY_HIGH
+          else (1.0 if rsi > RSI_ENTRY_HIGH else 0.0),
+          W_RSI_BAND)
+    _comp("ma100",
+          W_MA100 if (above_ma100 and ma100_rising)
+          else (W_MA100 / 2 if above_ma100 else 0.0),
+          W_MA100)
+    ichi_earned = 0.0
     if ichi:
         if ichi["tenkan_above_kijun"]:
-            sub["ichimoku"] += W_ICHI_TK
+            ichi_earned += W_ICHI_TK
         if ichi["cloud_green"]:
-            sub["ichimoku"] += W_ICHI_CLOUD
+            ichi_earned += W_ICHI_CLOUD
         if ichi["price_above_cloud"]:
-            sub["ichimoku"] += W_ICHI_PRICE
-    sub["macd"] = W_MACD if (macd and macd["hist"] > 0) else 0.0
-    sub["bollinger"] = W_BOLL if (boll and not boll["squeeze"]
-                                  and 0.35 <= boll["pct_b"] <= 0.9) else 0.0
+            ichi_earned += W_ICHI_PRICE
+    _comp("ichimoku", ichi_earned, W_ICHI_TK + W_ICHI_CLOUD + W_ICHI_PRICE)
+    _comp("macd", W_MACD if (macd and macd["hist"] > 0) else 0.0, W_MACD)
+    _comp("bollinger",
+          W_BOLL if (boll and not boll["squeeze"] and 0.35 <= boll["pct_b"] <= 0.9)
+          else 0.0,
+          W_BOLL)
+    # v3.2 components - only enter the denominator when their data exists
+    if vol_state is not None:
+        _comp("volume", vol_state["earned"], W_VOLUME)
+    if sr is not None:
+        _comp("support_resistance", sr["earned"], W_SR)
+    if fibp is not None:
+        _comp("fib_price", fibp["earned"], W_FIBP)
+    if pf is not None and not pf.get("stale"):
+        _comp("pitchfork", pf["earned"], W_PITCHFORK)
+    fund_notes: list = []
+    if fundamentals:
+        fund_earned, fund_notes = _fundamentals_earned(fundamentals)
+        _comp("fundamentals", fund_earned, W_FUND)
+    if market_regime is not None:
+        _comp("market_regime",
+              W_REGIME if market_regime.get("risk_on") else 0.0, W_REGIME)
+    # bonus: displayed in sub_scores, excluded from normalization
     sub["monthly_rsi_reversal_bonus"] = (
         B_MONTHLY_OVERSOLD
         if (monthly_rsi is not None and monthly_rsi <= MONTHLY_RSI_OVERSOLD
@@ -1013,6 +1273,30 @@ def score_setup(symbol, region, closes, highs, lows, *,
     supports.extend(ctx_sup)
     conflicts.extend(event_conflicts)   # earnings / ex-dividend gap risk
 
+    # v3.2 structural evidence -> supports / conflicts
+    if sr is not None:
+        if sr["conflict"]:
+            conflicts.append(sr["conflict"])
+        elif sr["support"] is not None and sr["support_dist_atr"] is not None \
+                and sr["support_dist_atr"] <= SR_SUPPORT_ATR:
+            supports.append(f"pivot support ~{sr['support']:.2f} "
+                            f"({sr['support_dist_atr']} ATR) beneath price")
+    if fibp is not None:
+        supports.extend(fibp["notes"])
+    if pf is not None and not pf.get("stale"):
+        if pf.get("conflict"):
+            conflicts.append(pf["conflict"])
+        else:
+            supports.extend(pf.get("notes", []))
+    if vol_state is not None and vol_state["earned"] >= W_VOLUME * 0.75:
+        supports.extend(vol_state["notes"])
+    if fund_notes:
+        supports.append("fundamentals: " + ", ".join(fund_notes))
+    if market_regime is not None and not market_regime.get("risk_on"):
+        conflicts.append(
+            f"market regime risk-off: {market_regime.get('index', 'index')} below "
+            "its 200-day MA - bullish setups fight the tape")
+
     # -- penalties --
     pen: dict = {}
     pen["conflict_penalty"] = min(CONFLICT_CAP, CONFLICT_UNIT * len(conflicts))
@@ -1026,8 +1310,19 @@ def score_setup(symbol, region, closes, highs, lows, *,
         dq += DQ_PENALTY_THIN
     pen["data_quality_penalty"] = dq
 
-    raw = sum(sub.values())
-    score = max(0.0, min(100.0, raw - sum(pen.values())))
+    # Liquidity screen: 20-day average turnover (price x volume, instrument
+    # currency). Thin instruments can show clean bars but be expensive to trade.
+    turnover_20d = None
+    if vol_state is not None and len(closes) >= 21:
+        turnover_20d = sum(c * v for c, v in zip(closes[-20:], volumes[-20:])) / 20
+        pen["liquidity_penalty"] = LIQ_PENALTY if turnover_20d < LIQ_MIN_TURNOVER else 0.0
+
+    # Dynamic normalization: score over the components whose data exists.
+    raw = sum(v for k, v in sub.items() if k in sub_max)
+    raw_max = sum(sub_max.values())
+    base_score = 100.0 * raw / raw_max if raw_max > EPS else 0.0
+    bonus = sub["monthly_rsi_reversal_bonus"]
+    score = max(0.0, min(100.0, base_score + bonus - sum(pen.values())))
 
     # -- grade (stricter than v2: MA100 + zero-conflict gate for A) --
     entry_ok = (extended_atr <= EXTENDED_ATR_MULT) and (RSI_ENTRY_LOW <= rsi <= RSI_ENTRY_HIGH)
@@ -1038,6 +1333,9 @@ def score_setup(symbol, region, closes, highs, lows, *,
         grade = "B"
     else:
         grade = "C"
+    # A risk-off tape caps the grade: no A-grade buys against the index regime.
+    if market_regime is not None and not market_regime.get("risk_on") and grade == "A":
+        grade = "B"
 
     classification, setup_type, risk_level = _classify(
         aligned=aligned, extended_atr=extended_atr, monthly_rsi=monthly_rsi,
@@ -1081,7 +1379,16 @@ def score_setup(symbol, region, closes, highs, lows, *,
         weekly_rsi=round(weekly_rsi, 1) if weekly_rsi is not None else None,
         monthly_rsi=round(monthly_rsi, 1) if monthly_rsi is not None else None,
         sub_scores={k: round(v, 1) for k, v in sub.items()},
+        sub_scores_max={k: round(v, 1) for k, v in sub_max.items()},
         penalties={k: round(v, 1) for k, v in pen.items()},
+        market_regime=market_regime,
+        volume=({k: (round(v, 1) if isinstance(v, float) else v)
+                 for k, v in vol_state.items()} if vol_state else None),
+        support_resistance=sr,
+        fib_price_levels=fibp,
+        pitchfork=pf,
+        fundamentals_notes=fund_notes or None,
+        liquidity_turnover_20d=(round(turnover_20d) if turnover_20d is not None else None),
         conflicts=conflicts, supports=supports,
         strongest_supporting=strongest_sup, strongest_opposing=strongest_opp,
         data_quality={"daily_bars": len(closes),
@@ -1115,16 +1422,24 @@ def score_setup(symbol, region, closes, highs, lows, *,
             "dividend_calendar": bool(event_context and event_context.get("next_ex_dividend_date")),
             "ledger_timing_calibration": bool(calibration and calibration.get("reliable")),
             "tax_note_excluded_from_score": True,
+            # v3.2: dynamic - True when this signal actually consulted the data
+            "volume": vol_state is not None,
+            "andrews_pitchfork": pf is not None and not pf.get("stale", False),
+            "support_resistance_levels": sr is not None,
+            "fib_price_clusters": fibp is not None,
+            "fundamentals_in_score": bool(fundamentals),
+            "market_regime_filter": market_regime is not None,
+            "holiday_calendar": not cal_days,
+            "crypto_calendar_days": cal_days,
+            "liquidity_screen": turnover_20d is not None,
             # honest gaps (see CLAUDE.md "Additional factors"):
-            "volume": False,
-            "andrews_pitchfork": False,
-            "support_resistance_levels": False,
-            "fundamentals_in_score": False,
             "news_in_score": False,
-            "market_regime_filter": False,
         },
         debug={
-            "raw_score": round(raw, 1),
+            "raw_score": round(base_score, 1),
+            "raw_points": round(raw, 1),
+            "raw_points_max": round(raw_max, 1),
+            "pivot_count": len(pivots),
             "ichimoku": {k: (round(v, 3) if isinstance(v, float) else v)
                          for k, v in ichi.items()} if ichi else None,
             "macd": {k: (round(v, 4) if isinstance(v, float) else v)
