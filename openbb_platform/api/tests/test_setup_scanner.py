@@ -371,3 +371,107 @@ def test_garbage_event_dates_degrade_silently():
     assert r is not None
     assert r["events"]["earnings_in_window"] is False
     assert r["events"]["ex_dividend_in_window"] is False
+
+
+# ── v3.1: compliance matrix, Fib time tools, copper/silver, SKF regression ───
+
+def test_compliance_matrix_present_and_honest():
+    closes, highs, lows = trend_series()
+    r = score_setup("X", "Swedish", closes, highs, lows)
+    c = r["compliance"]
+    # consulted components report True with real data
+    for k in ("trend_daily_weekly_monthly", "daily_rsi", "monthly_rsi", "ma100",
+              "ichimoku_state", "ichimoku_time_numbers", "macd", "bollinger",
+              "atr", "fib_time_zones", "fib_circles",
+              "tax_note_excluded_from_score"):
+        assert c[k] is True, f"compliance[{k}] should be True"
+    # known-unimplemented components must report honest False
+    for k in ("volume", "andrews_pitchfork", "support_resistance_levels",
+              "fundamentals_in_score", "news_in_score", "market_regime_filter"):
+        assert c[k] is False, f"compliance[{k}] must be honest False"
+    # context-dependent flags reflect what was passed
+    assert c["harmonics_consulted"] is False
+    r2 = score_setup("X", "Swedish", closes, highs, lows,
+                     technical_context={"harmonics": []})
+    assert r2["compliance"]["harmonics_consulted"] is True
+
+
+def test_trend_based_fib_time_projection_math():
+    from api.setup_scanner import _tbft_candidates
+    # pivots A@0, B@20 (leg = 20 bars), C@40; today = bar 48
+    piv = [(0, 100.0), (20, 120.0), (40, 105.0)]
+    cands = dict(_tbft_candidates(piv, 48))
+    assert cands[0.618] == 40 + round(0.618 * 20) - 48          # ~4 days ahead
+    assert cands[1.0] == 12
+    assert cands[1.618] == 40 + round(1.618 * 20) - 48          # ~24 days ahead
+    # projections already in the past are dropped
+    assert all(d > 0 for d in cands.values())
+    assert _tbft_candidates(piv[:2], 48) == []                  # needs 3 pivots
+
+
+def test_fib_circle_projection_math():
+    from api.setup_scanner import _fib_circle_candidates
+    # target 5 ATR above the pivot, pivot 20 bars ago
+    cands = dict(_fib_circle_candidates(20, 5.0))
+    for radius, d_ahead in cands.items():
+        expected = round((radius ** 2 - 25) ** 0.5) - 20
+        assert d_ahead == expected and d_ahead > 0
+    # radius smaller than the price distance can never be reached
+    assert 21 not in dict(_fib_circle_candidates(20, 25.0))
+
+
+def test_timing_tools_checked_reported():
+    closes, highs, lows = trend_series()
+    r = score_setup("X", "Swedish", closes, highs, lows)
+    tools = r["timing_tools_checked"]
+    assert tools["fib_time_zones"] is True
+    assert tools["fib_circles"] is True
+    assert tools["ichimoku_time_numbers"] is True
+    assert "trend_based_fib_time" in tools
+
+
+def test_universe_has_copper_and_silver_with_proxy_labels():
+    from api.phase2_router import SETUP_UNIVERSE, _PROXY_META
+    for region in ("Swedish", "International"):
+        for ac in ("copper", "silver"):
+            syms = [s for s, r, a in SETUP_UNIVERSE if r == region and a == ac]
+            assert syms, f"no {region} {ac} instruments in universe"
+            for s in syms:
+                assert s in _PROXY_META, f"{s} lacks an honest proxy label"
+
+
+def test_chikou_and_flat_tenkan_surface_as_supports():
+    closes, highs, lows = trend_series()
+    r = score_setup("X", "Swedish", closes, highs, lows)
+    ichi = r["debug"]["ichimoku"]
+    if ichi and ichi["chikou_free"]:
+        assert any("Chikou" in s for s in r["supports"])
+
+
+def test_skf_regression_pullback_not_reversal():
+    """SKF-B.ST audit case (2026-07-08): 3/3 timeframes up, pullback zone,
+    monthly RSI ~70 (NOT oversold), earnings inside window. The engine must
+    classify as continuation/pullback - never an oversold Reversal - keep the
+    earnings conflict visible, and stay fully reproducible."""
+    from datetime import date, timedelta
+    closes, highs, lows = trend_series()          # sustained uptrend fixture
+    as_of = date(2026, 7, 8)
+    ev = {"next_earnings_date": (as_of + timedelta(days=9)).isoformat()}
+    ctx = {"harmonics": [], "elliott": {
+        "structure": "TRIANGLE_BARRIER", "status": "COMPLETE",
+        "direction": "BEARISH", "current_wave": "Wave E"}}
+    r1 = score_setup("SKF-B.ST", "Swedish", closes, highs, lows,
+                     name="AB SKF (publ)", as_of=as_of,
+                     technical_context=ctx, event_context=ev)
+    r2 = score_setup("SKF-B.ST", "Swedish", closes, highs, lows,
+                     name="AB SKF (publ)", as_of=as_of,
+                     technical_context=ctx, event_context=ev)
+    assert r1 == r2                                # reproducible from same data
+    assert r1["classification"] != "Reversal Buy Setup"
+    assert r1["monthly_rsi"] is None or r1["monthly_rsi"] > MONTHLY_RSI_OVERSOLD
+    assert r1["events"]["earnings_in_window"] is True
+    assert r1["timing_reliability"] != "high"
+    assert any("downside structure exhausted" in s for s in r1["supports"])
+    assert r1["risk_level"] in ("Elevated", "High", "Moderate-High")
+    # full transparency: sub-scores + penalties + compliance always present
+    assert r1["sub_scores"] and r1["penalties"] and r1["compliance"]

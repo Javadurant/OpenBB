@@ -93,6 +93,10 @@ SPECIAL_TIME_NUMBERS: Final = (35, 52, 442)   # 26 * 17 = 442
 
 # Standard Fibonacci time-zone steps (bars from anchor pivot).
 FIB_TIME_STEPS: Final = (3, 5, 8, 13, 21, 34, 55, 89, 144)
+# Trend-Based Fib Time: prior-leg duration ratios projected from the 3rd pivot.
+TBF_TIME_RATIOS: Final = (0.618, 1.0, 1.618)
+# Fib Circles: price-time radii (bars x ATR units) centred on the anchor pivot.
+FIB_CIRCLE_RADII: Final = (21, 34, 55, 89, 144)
 TIMING_SNAP_TOL: Final = 0.25    # a confluence day may nudge base by <= 25%
 
 # -- Scoring weights (documented; raw max = 100 before penalties) ------------
@@ -188,6 +192,7 @@ class SetupResult(TypedDict, total=False):
     timing_confluence_sources: list
     data_quality:          dict
     events:                dict           # earnings / ex-dividend window flags
+    compliance:            dict           # per-signal component-consulted matrix
     technical_context_used: bool
     debug:                 dict
 
@@ -411,10 +416,46 @@ def _median(xs: list) -> float:
     return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
 
 
+def _tbft_candidates(pivots: list, last_idx: int) -> list:
+    """Trend-Based Fib Time: from the last three ZigZag pivots (A, B, C),
+    project TBF_TIME_RATIOS of the prior leg's DURATION (B-A bars) forward
+    from C. Returns [(ratio, days_ahead), ...] with days_ahead > 0."""
+    if len(pivots) < 3:
+        return []
+    a_i = pivots[-3][0]
+    b_i = pivots[-2][0]
+    c_i = pivots[-1][0]
+    leg = max(1, b_i - a_i)
+    out = []
+    for ratio in TBF_TIME_RATIOS:
+        d_ahead = c_i + round(ratio * leg) - last_idx
+        if d_ahead > 0:
+            out.append((ratio, d_ahead))
+    return out
+
+
+def _fib_circle_candidates(bars_since_pivot: int, price_dist_atr: float) -> list:
+    """Fib Circles: price-time geometry centred on the anchor pivot, with time
+    in bars and price in ATR units. A circle of radius R crosses the TARGET
+    price level sqrt(R^2 - y^2) bars from the pivot (y = |target - pivot| in
+    ATR). Returns [(radius, days_ahead), ...]. Chart geometry converted into
+    a testable confluence check - no fake visual precision."""
+    out = []
+    for radius in FIB_CIRCLE_RADII:
+        if radius <= price_dist_atr:
+            continue
+        x = (radius ** 2 - price_dist_atr ** 2) ** 0.5
+        d_ahead = round(x) - bars_since_pivot
+        if d_ahead > 0:
+            out.append((radius, d_ahead))
+    return out
+
+
 def _time_to_target(closes: list, lows: list, atr: float, entry: float,
                     target: float, boll: Optional[dict],
                     as_of: Optional[date],
-                    calibration: Optional[dict] = None) -> dict:
+                    calibration: Optional[dict] = None,
+                    highs: Optional[list] = None) -> dict:
     """Estimate trading-day windows to target from ATR distance + realised speed,
     then cross-check against Fib Time Zones and Ichimoku time numbers counted
     from the anchor pivot. Confluence NUDGES the base case (<= TIMING_SNAP_TOL)
@@ -470,7 +511,29 @@ def _time_to_target(closes: list, lows: list, atr: float, entry: float,
     fib_hit = _check(FIB_TIME_STEPS, "Fib time zone")
     kijun_hit = _check(KIJUN_TIME_NUMBERS + SPECIAL_TIME_NUMBERS, "Kijun time number")
     tenkan_hit = _check(TENKAN_TIME_NUMBERS, "Tenkan time number")
-    hits = [h for h in (fib_hit, kijun_hit, tenkan_hit) if h is not None]
+
+    # Trend-Based Fib Time: prior-leg duration ratios projected from pivot C.
+    tbft_hit = None
+    pivots3 = zigzag_pivots(highs, lows, atr, max_pivots=6) if highs else []
+    for _ratio, d_ahead in _tbft_candidates(pivots3, len(closes) - 1):
+        if snap_lo <= d_ahead <= snap_hi:
+            confluence.append(
+                f"Trend-Based Fib Time {_ratio} of prior leg -> ~{d_ahead} trading days ahead")
+            tbft_hit = d_ahead
+            break
+
+    # Fib Circles: price-time geometry from the anchor pivot.
+    circle_hit = None
+    y_atr = abs(target - lows[anchor]) / atr if atr > EPS else 0.0
+    for _radius, d_ahead in _fib_circle_candidates(bars_since, y_atr):
+        if snap_lo <= d_ahead <= snap_hi:
+            confluence.append(
+                f"Fib circle radius {_radius} (price-time) -> ~{d_ahead} trading days ahead")
+            circle_hit = d_ahead
+            break
+
+    hits = [h for h in (fib_hit, kijun_hit, tenkan_hit, tbft_hit, circle_hit)
+            if h is not None]
     if hits:
         expected = min(hits, key=lambda d: abs(d - expected))
         reasons.append("timing confluence nudged base case")
@@ -498,6 +561,13 @@ def _time_to_target(closes: list, lows: list, atr: float, entry: float,
         "timing_reasoning": "; ".join(reasons),
         "timing_confluence_sources": confluence,
         "historical_calibration_error": calib_err,
+        "timing_tools_checked": {
+            "fib_time_zones": True,
+            "trend_based_fib_time": len(pivots3) >= 3,
+            "fib_circles": True,
+            "ichimoku_time_numbers": True,
+            "ledger_calibration": calibrated,
+        },
         "time_window_days": f"{earliest}-{latest} trading days",
     }
 
@@ -849,7 +919,7 @@ def score_setup(symbol, region, closes, highs, lows, *,
     risk = entry - stop
     target = round(entry + REWARD_RISK * risk, 2)
     timing = _time_to_target(closes, lows, atr, entry, target, boll, as_of,
-                             calibration=calibration)
+                             calibration=calibration, highs=highs)
 
     # -- corporate-event gap risk (earnings / ex-dividend inside the window) --
     event_conflicts, events_summary = _event_flags(
@@ -912,6 +982,15 @@ def score_setup(symbol, region, closes, highs, lows, *,
             conflicts.append(
                 f"flat Kijun {ichi['kijun_dist_atr']:.1f} ATR below price - "
                 "mean-reversion magnet (Kijun catch-up risk)")
+        if ichi["chikou_free"]:
+            supports.append("Chikou span clear of price (26 bars back)")
+        # Hunting-dog stance: a flat Tenkan hugging price while above the Kijun
+        # is the dog standing at support waiting for the hunter to catch up.
+        if (ichi["tenkan_flat"] and ichi["tenkan_above_kijun"]
+                and abs(price - ichi["tenkan"]) <= 0.5 * atr):
+            supports.append(
+                "flat Tenkan at price with Tenkan above Kijun - "
+                "support holding while Kijun catches up")
     if macd and macd["hist"] < 0 and aligned >= 2:
         conflicts.append("MACD histogram falling while trend is up (momentum fading)")
     elif macd and macd["hist"] > 0:
@@ -1010,6 +1089,40 @@ def score_setup(symbol, region, closes, highs, lows, *,
                       "weekly_rsi_available": weekly_rsi is not None},
         events=events_summary,
         technical_context_used=technical_context is not None,
+        # Per-signal compliance matrix: which required components were actually
+        # consulted for THIS signal. Honest False for known-unimplemented parts
+        # (prompt-compliance mandate: never imply an input that was not used).
+        compliance={
+            "trend_daily_weekly_monthly": True,
+            "daily_rsi": True,
+            "weekly_rsi": weekly_rsi is not None,
+            "monthly_rsi": monthly_rsi is not None,
+            "ma100": ma100 is not None,
+            "ichimoku_state": ichi is not None,
+            "ichimoku_time_numbers": True,
+            "tenkan_kijun_flattening": ichi is not None,
+            "kijun_catchup_risk": ichi is not None,
+            "chikou_proxy": ichi is not None,
+            "macd": macd is not None,
+            "bollinger": boll is not None,
+            "atr": True,
+            "fib_time_zones": True,
+            "trend_based_fib_time": timing["timing_tools_checked"]["trend_based_fib_time"],
+            "fib_circles": True,
+            "harmonics_consulted": technical_context is not None,
+            "elliott_consulted": bool(technical_context and technical_context.get("elliott")),
+            "earnings_calendar": bool(event_context and event_context.get("next_earnings_date")),
+            "dividend_calendar": bool(event_context and event_context.get("next_ex_dividend_date")),
+            "ledger_timing_calibration": bool(calibration and calibration.get("reliable")),
+            "tax_note_excluded_from_score": True,
+            # honest gaps (see CLAUDE.md "Additional factors"):
+            "volume": False,
+            "andrews_pitchfork": False,
+            "support_resistance_levels": False,
+            "fundamentals_in_score": False,
+            "news_in_score": False,
+            "market_regime_filter": False,
+        },
         debug={
             "raw_score": round(raw, 1),
             "ichimoku": {k: (round(v, 3) if isinstance(v, float) else v)
@@ -1049,7 +1162,7 @@ def _isk_kf_note(region: str, dividend_yield: Optional[float], asset_class: str 
             "capital income (30%). For tax-wrapped exposure, use a Swedish crypto ETP in an ISK."
         )
 
-    if asset_class in ("gold", "oil"):
+    if asset_class in ("gold", "oil", "copper", "silver"):
         if region == "Swedish":
             return (
                 f"Stockholm-listed commodity certificates/ETCs are ISK/KF-eligible. "

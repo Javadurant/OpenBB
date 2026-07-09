@@ -946,6 +946,73 @@ def _symbol_facts(symbol: str) -> tuple[str, float, dict]:
     return str(company), price, facts
 
 
+def _technical_evidence(symbol: str) -> tuple[dict, Optional[dict]]:
+    """Run the Setup Scanner engine (the same engine as Setup of the Day) on the
+    symbol so the chairman board consumes the SAME hard technical evidence -
+    monthly RSI, 100-day MA, Ichimoku state, MACD, harmonic/Elliott context,
+    earnings/ex-div windows, honest classification.
+
+    Audit mandate (SKF-B.ST case, 2026-07-08): the famous-investor board must
+    not REPLACE technical analysis - its levels were pure conviction-scaled ATR
+    arithmetic. Returns (extra_facts_for_member_prompts, evidence_block_for_ui).
+    Best effort: any failure degrades to ({}, None) and the board still runs."""
+    try:
+        eng = _import_engines()
+        df = eng["_fetch_ohlcv"](symbol, years=3)
+        if df is None or df.empty or len(df) < 60:
+            return {}, None
+        closes = [float(x) for x in df["close"]]
+        highs = [float(x) for x in df["high"]]
+        lows = [float(x) for x in df["low"]]
+        from .setup_scanner import score_setup, build_technical_context, _atr
+        atr = _atr(highs, lows, closes)
+        ctx = build_technical_context(highs, lows, closes, atr, symbol=symbol) if atr else None
+        cal = None
+        try:
+            from .setup_ledger import timing_calibration
+            cal = timing_calibration()
+        except Exception:  # noqa: BLE001
+            pass
+        ev = None
+        try:
+            from .phase2_router import _fetch_event_context
+            ev = _fetch_event_context(symbol, "equity")
+        except Exception:  # noqa: BLE001
+            pass
+        region = "Swedish" if symbol.upper().endswith(".ST") else "International"
+        r = score_setup(symbol, region, closes, highs, lows,
+                        technical_context=ctx, event_context=ev, calibration=cal)
+        if not r:
+            return {}, None
+        facts = {
+            "Setup Classification": f"{r['classification']} ({r['setup_type']})",
+            "Technical Score": f"{r['score']:.0f}/100 (grade {r['grade']})",
+            "Monthly RSI": (f"{r['monthly_rsi']:.0f}"
+                            if r.get("monthly_rsi") is not None else "n/a"),
+            "Weekly RSI": (f"{r['weekly_rsi']:.0f}"
+                           if r.get("weekly_rsi") is not None else "n/a"),
+            "vs 100-day MA": ("above" if any("100-day" in s for s in r.get("supports", []))
+                              else "below/at"),
+            "MACD": "positive" if r["sub_scores"].get("macd") else "negative/flat",
+            "Strongest Conflict": (r["conflicts"][0][:140]
+                                   if r.get("conflicts") else "none detected"),
+        }
+        evidence = {k: r.get(k) for k in (
+            "classification", "setup_type", "grade", "score", "confidence",
+            "risk_level", "entry", "stop", "target", "reward_risk",
+            "invalidation", "time_window_days",
+            "earliest_target_date", "base_case_target_date", "latest_target_date",
+            "expected_target_time", "timing_confidence", "timing_reliability",
+            "timing_confluence_sources", "historical_calibration_error",
+            "sub_scores", "penalties", "conflicts", "supports",
+            "strongest_supporting", "strongest_opposing", "events", "compliance",
+            "monthly_rsi", "weekly_rsi", "rsi_14", "atr_14")}
+        return facts, evidence
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("technical evidence %s: %s", symbol, exc)
+        return {}, None
+
+
 def _parse_fw(raw: str) -> tuple[str, int, str]:
     """Parse a member response into (verdict, score, thesis)."""
     def g(p, d=""):
@@ -1131,6 +1198,10 @@ def chairman(symbol: str) -> dict[str, Any]:
     from datetime import datetime, timezone
     try:
         company, price, facts = _symbol_facts(symbol)
+        # Audit fix (SKF case): every board member now sees the Setup Scanner's
+        # hard technical evidence, and the response carries the full block.
+        tech_facts, tech_evidence = _technical_evidence(symbol)
+        facts.update(tech_facts)
         names = list_frameworks()
         groq_key = os.getenv("GROQ_API_KEY", "")
 
@@ -1195,6 +1266,7 @@ def chairman(symbol: str) -> dict[str, Any]:
             "decision_date": now.strftime("%Y-%m-%d"), "decision_time": now.strftime("%H:%M:%S UTC"),
             "final_signal": final, "conviction": conviction, "rationale": rationale,
             "ticket": ticket,
+            "technical_evidence": tech_evidence,   # Setup Scanner block (audit fix)
             "tally": tally, "board": board, "members": len(board),
             "ai_powered": bool(groq_key),
             "disclaimer": ("Synthesis of 10 published investor frameworks applied to live "

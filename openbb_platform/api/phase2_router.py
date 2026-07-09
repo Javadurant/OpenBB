@@ -397,7 +397,15 @@ SETUP_UNIVERSE: list[tuple[str, str, str]] = (
     # ── Oil (v3): Swedish-accessible + international ──
     [(s, "Swedish", "oil") for s in ("OLJA.ST",)] +            # Handelsbanken certificate (SEK)
     [(s, "Swedish", "oil") for s in ("CRUD.L",)] +             # WisdomTree WTI ETC (PRIIPs OK)
-    [(s, "International", "oil") for s in ("USO","BNO","CL=F","BZ=F")]
+    [(s, "International", "oil") for s in ("USO","BNO","CL=F","BZ=F")] +
+    # ── Copper (v3.1): Swedish-accessible + international ──
+    [(s, "Swedish", "copper") for s in ("KOPPAR.ST",)] +       # Handelsbanken certificate (SEK)
+    [(s, "Swedish", "copper") for s in ("COPA.L",)] +          # WisdomTree Copper ETC (PRIIPs OK)
+    [(s, "International", "copper") for s in ("CPER","HG=F")] +
+    # ── Silver (v3.1): Swedish-accessible + international ──
+    [(s, "Swedish", "silver") for s in ("SILVER.ST",)] +       # Handelsbanken certificate (SEK)
+    [(s, "Swedish", "silver") for s in ("PHAG.L",)] +          # WisdomTree Physical Silver (PRIIPs OK)
+    [(s, "International", "silver") for s in ("SLV","SI=F")]
 )
 
 # v3: honest proxy labelling for indirect commodity/crypto exposure.
@@ -414,6 +422,14 @@ _PROXY_META: dict[str, str] = {
     "BNO":      "US-listed Brent futures ETF proxy (roll costs apply; not spot oil)",
     "CL=F":     "NYMEX WTI futures front month — futures proxy for spot oil",
     "BZ=F":     "ICE Brent futures front month — futures proxy for spot oil",
+    "KOPPAR.ST": "Swedish-listed copper certificate (SEK) — tracks LME copper, ISK/KF-eligible",
+    "COPA.L":   "WisdomTree Copper ETC (LSE, USD) — futures-based proxy, accessible to Swedish investors",
+    "CPER":     "US-listed copper futures ETF proxy (roll costs apply; not spot copper)",
+    "HG=F":     "COMEX copper futures front month — futures proxy for spot copper",
+    "SILVER.ST": "Swedish-listed silver certificate (SEK) — tracks spot silver, ISK/KF-eligible",
+    "PHAG.L":   "WisdomTree Physical Silver ETC (LSE, USD) — physically-backed proxy, accessible to Swedish investors",
+    "SLV":      "US-listed silver ETF proxy (not spot silver)",
+    "SI=F":     "COMEX silver futures front month — futures proxy for spot silver",
 }
 
 # <- NEW [Phase3-Step2]: display names for EODHD 0P fund codes (yfinance can't name them).
@@ -593,15 +609,18 @@ def setup_of_the_day(refresh: bool = False) -> dict[str, Any]:
                 scored.append(r)
 
     # Group into boxes[region][asset_class] → best by (direct-before-proxy, score).
-    classes = ("equity", "etf", "fund", "crypto", "gold", "oil")   # v3: + gold/oil
+    classes = ("equity", "etf", "fund", "crypto",
+               "gold", "oil", "copper", "silver")   # v3: + gold/oil; v3.1: + copper/silver
     boxes: dict[str, Any] = {}
     for region in ("Swedish", "International"):
         boxes[region] = {}
         for ac in classes:
             members = [s for s in scored if s.get("region") == region and s.get("asset_class") == ac]
             # Direct Swedish-listed instruments beat proxies at selection time;
-            # within each tier, highest score wins.
-            members.sort(key=lambda r: (bool(r.get("proxy")), -r.get("score", 0)))
+            # within each tier, highest score wins; symbol breaks exact ties so
+            # selection is deterministic run-to-run (audit: reproducibility).
+            members.sort(key=lambda r: (bool(r.get("proxy")), -r.get("score", 0),
+                                        r.get("symbol", "")))
             top = members[0] if members else None
             has_quality = bool(top and top.get("grade") in ("A", "B"))
             if not members:
