@@ -490,6 +490,7 @@ def _news_context(sym: str, limit: int = 8) -> Optional[dict]:
             content = it.get("content") or it
             ts = content.get("pubDate") or content.get("providerPublishTime")
             title = (content.get("title") or "").strip()
+            summary = (content.get("summary") or content.get("description") or "").strip()
             age_days = None
             try:
                 if isinstance(ts, (int, float)):
@@ -499,7 +500,8 @@ def _news_context(sym: str, limit: int = 8) -> Optional[dict]:
             except (ValueError, TypeError, OSError):
                 pass
             if title:
-                recent.append({"title": title[:120], "age_days": age_days})
+                recent.append({"title": title[:120], "summary": summary[:240],
+                               "age_days": age_days})
         last7 = sum(1 for r in recent if r["age_days"] is not None and r["age_days"] <= 7)
         return {"headlines": recent[:4], "count_7d": last7,
                 "latest_age_days": (recent[0]["age_days"] if recent else None),
@@ -507,6 +509,141 @@ def _news_context(sym: str, limit: int = 8) -> Optional[dict]:
     except Exception as exc:  # noqa: BLE001
         logger.debug("news context %s: %s", sym, exc)
         return None
+
+
+import threading as _threading
+
+# v3.3: sector relative strength via global SPDR sector proxies. Swedish
+# equities use the SAME global proxy (documented) - no Swedish sector ETF
+# family exists on the free feed; the GICS-style sector names from yfinance
+# map cleanly. Cached per process, guarded for the scan's thread pool.
+_SECTOR_PROXY: dict[str, str] = {
+    "Technology": "XLK", "Financial Services": "XLF", "Financials": "XLF",
+    "Healthcare": "XLV", "Health Care": "XLV", "Energy": "XLE",
+    "Industrials": "XLI", "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP", "Basic Materials": "XLB",
+    "Utilities": "XLU", "Communication Services": "XLC", "Real Estate": "XLRE",
+}
+_SECTOR_CACHE: dict[str, Optional[list]] = {}
+_SECTOR_LOCK = _threading.Lock()
+
+
+def _sector_closes(etf: str) -> Optional[list]:
+    with _SECTOR_LOCK:
+        if etf in _SECTOR_CACHE:
+            return _SECTOR_CACHE[etf]
+    closes = None
+    try:
+        import yfinance as yf
+        h = yf.Ticker(etf).history(period="1y")
+        if len(h) >= 130:
+            closes = [float(x) for x in h["Close"]]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sector proxy %s: %s", etf, exc)
+    with _SECTOR_LOCK:
+        _SECTOR_CACHE[etf] = closes
+    return closes
+
+
+def _sector_context_for(sector: Optional[str], closes: list) -> Optional[dict]:
+    """Relative performance vs the sector proxy over ~1m/3m/6m."""
+    etf = _SECTOR_PROXY.get(sector or "")
+    if not etf or len(closes) < 130:
+        return None
+    sc = _sector_closes(etf)
+    if not sc or len(sc) < 130:
+        return None
+
+    def _rel(n: int) -> Optional[float]:
+        if len(closes) <= n or len(sc) <= n:
+            return None
+        a = closes[-1] / closes[-1 - n] - 1
+        s = sc[-1] / sc[-1 - n] - 1
+        return round(a - s, 4)
+
+    return {"proxy": f"{etf} (global SPDR sector proxy)", "sector": sector,
+            "rel_1m": _rel(21), "rel_3m": _rel(63), "rel_6m": _rel(126)}
+
+
+# v3.3: FX context for Swedish-accessible non-SEK instruments (unhedged).
+_FX_CACHE: dict[str, Optional[dict]] = {}
+_FX_LOCK = _threading.Lock()
+
+
+def _fx_context_for(sym: str, region: str) -> Optional[dict]:
+    if region != "Swedish" or sym.upper().endswith(".ST"):
+        return None
+    cur = "EUR" if sym.upper().endswith(".DE") else "USD"
+    pair = "EURSEK=X" if cur == "EUR" else "USDSEK=X"
+    with _FX_LOCK:
+        if pair in _FX_CACHE:
+            cached = _FX_CACHE[pair]
+            return dict(cached, instrument_currency=cur) if cached else None
+    ctx = None
+    try:
+        import yfinance as yf
+        h = yf.Ticker(pair).history(period="1y")
+        c = [float(x) for x in h["Close"]]
+        if len(c) >= 70:
+            rets = [c[i] / c[i - 1] - 1 for i in range(1, len(c))]
+            mean = sum(rets) / len(rets)
+            var = sum((r - mean) ** 2 for r in rets) / len(rets)
+            ctx = {"pair": pair.replace("=X", ""), "rate": round(c[-1], 4),
+                   "trend_3m_pct": round((c[-1] / c[-63] - 1) * 100, 2) if len(c) > 63 else None,
+                   "vol_ann_pct": round((var ** 0.5) * (252 ** 0.5) * 100, 1),
+                   "reporting_currency": "SEK",
+                   "note": ("unhedged: SEK return = instrument return + "
+                            "FX change (not forecast)")}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fx context %s: %s", pair, exc)
+    with _FX_LOCK:
+        _FX_CACHE[pair] = ctx
+    return dict(ctx, instrument_currency=cur) if ctx else None
+
+
+def _real_quote(sym: str) -> Optional[dict]:
+    """Best-effort real bid/ask for a SELECTED finalist (yfinance info)."""
+    try:
+        import yfinance as yf
+        i = yf.Ticker(sym).info or {}
+        bid, ask = i.get("bid"), i.get("ask")
+        if isinstance(bid, (int, float)) and isinstance(ask, (int, float)) \
+                and bid > 0 and ask >= bid:
+            return {"bid": float(bid), "ask": float(ask)}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("real quote %s: %s", sym, exc)
+    return None
+
+
+def _intraday_refine_top(top: dict) -> None:
+    """Refine a SELECTED setup's target date into an intraday datetime using
+    real yfinance 60m bars (60-day depth, verified available incl. .ST).
+    Finalists only - never per-candidate. Mutates top['intraday'] in place."""
+    sym = top.get("symbol")
+    try:
+        import yfinance as yf
+        from .setup_scanner import refine_target_time_intraday
+        h = yf.Ticker(sym).history(period="60d", interval="60m")
+        if h is None or len(h) < 30:
+            top["intraday"] = {"intraday_available": False, "intraday_source": "yfinance 60m",
+                               "fallback_reason": f"only {0 if h is None else len(h)} intraday bars returned"}
+            return
+        bars_per_day = 24.0 if top.get("asset_class") == "crypto" else \
+            8.5 if str(sym).upper().endswith(".ST") else 7.0
+        tz = "Europe/Stockholm" if str(sym).upper().endswith(".ST") else \
+            "exchange local" if top.get("asset_class") != "crypto" else "UTC (24/7)"
+        res = refine_target_time_intraday(
+            top.get("base_case_target_date", ""), 
+            float(top["target"]) - float(top["entry"]),
+            [float(x) for x in h["High"]], [float(x) for x in h["Low"]],
+            [float(x) for x in h["Close"]], bars_per_day, tz)
+        res["intraday_source"] = "yfinance 60m bars (60-day depth)"
+        top["intraday"] = res
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("intraday refine %s: %s", sym, exc)
+        top["intraday"] = {"intraday_available": False,
+                           "intraday_source": "yfinance 60m",
+                           "fallback_reason": f"fetch/refine error: {exc}"}
 
 
 def _fetch_event_context(sym: str, asset_class: str) -> Optional[dict]:
@@ -559,6 +696,19 @@ def _fetch_event_context(sym: str, asset_class: str) -> Optional[dict]:
     except Exception as exc:  # noqa: BLE001
         logger.debug("event context skipped for %s: %s", sym, exc)
         return None
+
+
+def _candidate_news(sym: str, asset_class: str, as_of: str) -> Optional[dict]:
+    """News items for scanner-side lexicon sentiment (equities/ETFs only;
+    yfinance source works for .ST symbols too, unlike FMP's thin Nordic feed)."""
+    if asset_class not in ("equity", "etf"):
+        return None
+    nc = _news_context(sym)
+    if not nc or not nc.get("headlines"):
+        return None
+    return {"items": nc["headlines"],
+            "source": "yfinance news + lexicon sentiment (model-derived)",
+            "as_of": as_of}
 
 
 def _fetch_and_score(entry: tuple[str, str, str],
@@ -623,6 +773,10 @@ def _fetch_and_score(entry: tuple[str, str, str],
             volumes=series.volumes,              # v3.2: real volume ingestion
             market_regime=(regime_map or {}).get(region),   # v3.2: index regime gate
             fundamentals=fundamentals,           # v3.2: fundamentals sub-score
+            # v3.3: news sentiment (lexicon), sector RS, FX context
+            news_context=_candidate_news(sym, asset_class, series.as_of.date().isoformat()),
+            sector_context=_sector_context_for(sector, closes),
+            fx_context=_fx_context_for(sym, region),
         )
         if r is not None:
             # <- NEW [Phase3-Step1]: stamp provenance (council mandate: source + as_of on every series)
@@ -726,9 +880,24 @@ def setup_of_the_day(refresh: bool = False) -> dict[str, Any]:
                 "biggest_strength": m.get("strongest_supporting"),
                 "biggest_weakness": m.get("strongest_opposing"),
             } for i, m in enumerate(members)]
-            # v3.2: news context for the SELECTED setup only (rate-limit safe).
-            if top is not None and ac not in ("gold", "oil", "copper", "silver"):
-                top["news"] = _news_context(top["symbol"])
+            # v3.3: finalist refinement (SELECTED setup only - rate-limit safe):
+            # intraday target-time, real bid/ask spread, FX-adjusted display.
+            if top is not None:
+                _intraday_refine_top(top)
+                q = _real_quote(top["symbol"])
+                if q is not None:
+                    from .setup_scanner import _spread_model as _sm
+                    real = _sm(top.get("last_price", 0.0), top.get("atr_14", 0.0),
+                               top.get("liquidity_turnover_20d"),
+                               top.get("asset_class", "equity"),
+                               bool(top.get("proxy")), bid=q["bid"], ask=q["ask"])
+                    if real is not None:
+                        top["spread"] = real   # real quote refines the proxy estimate
+                fxc = top.get("fx")
+                if fxc and fxc.get("rate") and top.get("target"):
+                    fxc["fx_adjusted_target_sek"] = round(top["target"] * fxc["rate"], 2)
+                    fxc["fx_adjusted_invalidation_sek"] = round(
+                        (top.get("invalidation") or 0) * fxc["rate"], 2)
             boxes[region][ac] = {
                 "top_setup":   top,
                 "has_quality": has_quality,

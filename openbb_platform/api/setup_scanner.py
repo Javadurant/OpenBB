@@ -151,6 +151,31 @@ LIQ_PENALTY:        Final = 3.0
 # Exchange holiday calendars for target-date math (VERIFY ANNUALLY - these are
 # configurable constants, not an astronomical calendar service). Crypto uses
 # plain calendar days (trades 7d/week).
+# -- v3.3 components (news, sector RS, spread, FX, OBV) ----------------------
+W_NEWS:             Final = 3.0
+W_SECTOR:           Final = 3.0
+NEWS_FRESH_DAYS:    Final = 7      # items older than this decay; > 21d ignored
+NEWS_STALE_DAYS:    Final = 21
+# Deterministic financial-news lexicon (model-derived sentiment - honest,
+# lower-confidence substitute while no licensed sentiment feed is configured).
+NEWS_POSITIVE_WORDS: Final = frozenset({
+    "beat", "beats", "raise", "raises", "raised", "upgrade", "upgraded",
+    "record", "growth", "surge", "surges", "wins", "win", "contract",
+    "buyback", "dividend increase", "outperform", "strong", "profit rise",
+    "expands", "expansion", "partnership", "approval", "approved"})
+NEWS_NEGATIVE_WORDS: Final = frozenset({
+    "miss", "misses", "cut", "cuts", "downgrade", "downgraded", "probe",
+    "lawsuit", "investigation", "recall", "warning", "warns", "profit warning",
+    "layoff", "layoffs", "fraud", "decline", "falls", "plunge", "plunges",
+    "weak", "loss", "losses", "bankruptcy", "default", "strike", "slump"})
+SPREAD_WIDE_PCT:    Final = 0.01   # >1% spread = wide, execution-risk penalty
+SPREAD_PENALTY:     Final = 2.0
+FX_VOL_PENALTY_AT:  Final = 8.0    # annualised FX vol above this (%) = penalty
+FX_PENALTY:         Final = 2.0
+OBV_SLOPE_BARS:     Final = 20
+PRZ_TOUCH_BARS:     Final = 10     # PRZ touched within this many bars = fresh
+PRZ_TOUCH_ATR:      Final = 1.0
+
 SWEDISH_HOLIDAYS: Final = frozenset({
     date(2026, 1, 1), date(2026, 1, 6), date(2026, 4, 3), date(2026, 4, 6),
     date(2026, 5, 1), date(2026, 5, 14), date(2026, 6, 19),
@@ -582,6 +607,191 @@ def _fundamentals_earned(f: dict) -> tuple:
     return earned, notes
 
 
+def news_sentiment(items: list) -> dict:
+    """Deterministic lexicon sentiment over headline+summary text.
+    items: [{"title": str, "summary": str?, "age_days": int?}, ...].
+    Recency-weighted: fresh (<= NEWS_FRESH_DAYS) full weight, linear decay to
+    NEWS_STALE_DAYS, older ignored. Honest provenance: method is
+    'lexicon (model-derived)' - lower confidence than a licensed feed."""
+    total_w, weighted = 0.0, 0.0
+    scored = 0
+    for it in items or []:
+        age = it.get("age_days")
+        if age is None or age > NEWS_STALE_DAYS:
+            continue
+        w = 1.0 if age <= NEWS_FRESH_DAYS else \
+            max(0.0, 1.0 - (age - NEWS_FRESH_DAYS) / (NEWS_STALE_DAYS - NEWS_FRESH_DAYS))
+        text = ((it.get("title") or "") + " " + (it.get("summary") or "")).lower()
+        pos = sum(1 for wrd in NEWS_POSITIVE_WORDS if wrd in text)
+        neg = sum(1 for wrd in NEWS_NEGATIVE_WORDS if wrd in text)
+        if pos == 0 and neg == 0:
+            continue
+        s = (pos - neg) / max(1, pos + neg)
+        weighted += w * s
+        total_w += w
+        scored += 1
+    if scored == 0:
+        return {"score": 0.0, "label": "neutral/none", "n_scored": 0,
+                "method": "lexicon (model-derived)", "confidence": "none"}
+    s = weighted / total_w
+    label = "positive" if s > 0.2 else "negative" if s < -0.2 else "neutral"
+    return {"score": round(s, 2), "label": label, "n_scored": scored,
+            "method": "lexicon (model-derived)", "confidence": "low"}
+
+
+def _news_component(news_context: Optional[dict]) -> Optional[dict]:
+    """news_score: recency + relevance + model-derived sentiment. Neutral or
+    missing news = component not counted (Data-Limited, never punished)."""
+    if not news_context or not news_context.get("items"):
+        return None
+    senti = news_sentiment(news_context["items"])
+    if senti["n_scored"] == 0:
+        return None
+    frac = (senti["score"] + 1.0) / 2.0            # -1..1 -> 0..1
+    earned = round(W_NEWS * frac, 2)
+    conflict = None
+    if senti["label"] == "negative":
+        conflict = (f"recent news flow is negative "
+                    f"({senti['n_scored']} scored items, lexicon-derived)")
+    return {"earned": earned, "sentiment": senti, "conflict": conflict,
+            "source": news_context.get("source", "?"),
+            "as_of": news_context.get("as_of")}
+
+
+def _sector_component(sector_context: Optional[dict]) -> Optional[dict]:
+    """Sector relative strength: asset return minus sector-proxy return over
+    ~1m/3m/6m windows. Outperforming most windows earns; lagging earns 0."""
+    if not sector_context:
+        return None
+    rels = [sector_context.get(k) for k in ("rel_1m", "rel_3m", "rel_6m")]
+    rels = [r for r in rels if isinstance(r, (int, float)) and math.isfinite(r)]
+    if not rels:
+        return None
+    wins = sum(1 for r in rels if r > 0)
+    earned = W_SECTOR * wins / len(rels)
+    label = ("sector leader" if wins == len(rels)
+             else "mixed vs sector" if wins > 0 else "sector laggard")
+    return {"earned": round(earned, 2), "windows": len(rels), "wins": wins,
+            "label": label, "proxy": sector_context.get("proxy"),
+            "rel_1m": sector_context.get("rel_1m"),
+            "rel_3m": sector_context.get("rel_3m"),
+            "rel_6m": sector_context.get("rel_6m")}
+
+
+def _spread_model(price: float, atr: float, turnover_20d: Optional[float],
+                  asset_class: str, is_proxy: bool,
+                  bid: Optional[float] = None,
+                  ask: Optional[float] = None) -> Optional[dict]:
+    """Execution-cost model. Real bid/ask when supplied (yfinance quote);
+    otherwise a documented turnover/volatility proxy estimate."""
+    if price <= EPS:
+        return None
+    if (isinstance(bid, (int, float)) and isinstance(ask, (int, float))
+            and bid > EPS and ask > bid - EPS and ask > EPS):
+        spread = max(0.0, ask - bid)
+        pct = spread / ((bid + ask) / 2)
+        source, model = "real bid/ask", "quote"
+    elif turnover_20d is not None and turnover_20d > EPS:
+        # Proxy: thin turnover widens spread; volatility widens it further.
+        base_bps = 5.0 if turnover_20d >= 50e6 else \
+            10.0 if turnover_20d >= 10e6 else \
+            25.0 if turnover_20d >= 1e6 else 60.0
+        vol_addon = min(20.0, (atr / price) * 100 * 2) if atr > EPS else 0.0
+        proxy_addon = 10.0 if is_proxy else 0.0
+        pct = (base_bps + vol_addon + proxy_addon) / 10_000
+        spread = pct * price
+        source, model = "turnover/volatility proxy estimate", "proxy"
+        bid = ask = None
+    else:
+        return None
+    wide = pct >= SPREAD_WIDE_PCT
+    return {"bid": bid, "ask": ask, "spread": round(spread, 4),
+            "spread_pct": round(pct * 100, 3), "spread_source": source,
+            "spread_model_type": model, "wide": wide,
+            "execution_risk": "high" if wide else
+            "moderate" if pct >= SPREAD_WIDE_PCT / 2 else "low"}
+
+
+def _obv_state(closes: list, volumes: Optional[list]) -> Optional[dict]:
+    """On-Balance Volume terminal state: slope over OBV_SLOPE_BARS bars."""
+    if not volumes or len(volumes) != len(closes) or len(closes) < OBV_SLOPE_BARS + 2:
+        return None
+    if sum(volumes[-OBV_SLOPE_BARS:]) <= EPS:
+        return None
+    obv, series = 0.0, [0.0]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i - 1]:
+            obv += volumes[i]
+        elif closes[i] < closes[i - 1]:
+            obv -= volumes[i]
+        series.append(obv)
+    window = series[-OBV_SLOPE_BARS:]
+    rising = window[-1] > window[0]
+    denom = abs(window[0]) if abs(window[0]) > EPS else 1.0
+    return {"obv": round(series[-1], 0), "rising": rising,
+            "slope_pct": round((window[-1] - window[0]) / denom * 100, 2)}
+
+
+def _prz_touch_volume(harmonics: list, highs: list, lows: list,
+                      volumes: Optional[list], atr: float) -> Optional[dict]:
+    """Volume behaviour at the freshest harmonic PRZ touch: expansion at a
+    bullish D = confirmation; expansion at a bearish D near price = rejection."""
+    if not harmonics or not volumes or len(volumes) < 25 or atr <= EPS:
+        return None
+    v20 = sum(volumes[-21:-1]) / 20
+    if v20 <= EPS:
+        return None
+    for h in harmonics:
+        d = h.get("d_price")
+        if d is None or h.get("age_bars", 999) > 90:
+            continue
+        for i in range(len(highs) - 1, max(0, len(highs) - 1 - PRZ_TOUCH_BARS), -1):
+            if lows[i] - PRZ_TOUCH_ATR * atr <= d <= highs[i] + PRZ_TOUCH_ATR * atr:
+                ratio = volumes[i] / v20
+                return {"pattern": h.get("name"), "bullish": h.get("bullish"),
+                        "touch_bar_age": len(highs) - 1 - i,
+                        "volume_ratio": round(ratio, 2),
+                        "confirmed": ratio >= VOL_BREAKOUT_MULT and bool(h.get("bullish")),
+                        "rejection": ratio >= VOL_BREAKOUT_MULT and not h.get("bullish")}
+    return None
+
+
+def refine_target_time_intraday(base_date_iso: str, dist_to_target: float,
+                                intra_highs: list, intra_lows: list,
+                                intra_closes: list, bars_per_day: float,
+                                tz_label: str = "exchange local") -> dict:
+    """Refine the daily base-case target DATE into a target DATETIME using real
+    intraday bars: hourly ATR + realised median per-bar speed estimate how far
+    into the target day the remaining distance completes. Never fabricates
+    sub-daily precision without intraday data - the caller falls back."""
+    n = len(intra_closes)
+    if n < 30 or bars_per_day <= 0:
+        return {"intraday_available": False,
+                "fallback_reason": f"insufficient intraday bars ({n})"}
+    moves = [abs(intra_closes[i] - intra_closes[i - 1]) for i in range(1, n)]
+    med = _median(moves)
+    if med <= EPS:
+        return {"intraday_available": False,
+                "fallback_reason": "flat intraday series (no measurable speed)"}
+    intra_atr = _atr(intra_highs, intra_lows, intra_closes)
+    # Bars needed on the final day ~ residual distance after full prior days.
+    bars_needed = dist_to_target / med
+    residual_bars = bars_needed % bars_per_day
+    hour_offset = max(1, min(int(round(residual_bars)), int(bars_per_day)))
+    return {
+        "intraday_available": True,
+        "intraday_resolution": "60m",
+        "intraday_bars": n,
+        "intraday_atr": round(intra_atr, 4) if intra_atr else None,
+        "intraday_median_bar_move": round(med, 4),
+        "expected_target_datetime": (
+            f"{base_date_iso} ~{hour_offset} trading hour(s) after the open "
+            f"({tz_label}; intraday estimate)"),
+        "target_time_basis": "intraday realised speed (60m bars)",
+        "target_time_confidence": "medium" if n >= 200 else "low",
+    }
+
+
 def _pivot_low_index(lows: list, lookback: int = 180) -> int:
     """Index of the most significant recent swing low (timing anchor)."""
     seg = lows[-lookback:] if len(lows) > lookback else lows
@@ -860,13 +1070,27 @@ def _elliott_context(highs: list, lows: list, closes: list,
         pref = res.preferred
         if pref is None:
             return None
-        return {
-            "structure": pref.count_type.value,
-            "current_wave": pref.current_wave,
-            "status": pref.status.value,
-            "direction": pref.direction.value,
-            "invalidation": float(pref.invalidation_level),
-        }
+
+        def _ser(count) -> dict:
+            return {
+                "structure": count.count_type.value,
+                "current_wave": count.current_wave,
+                "status": count.status.value,
+                "direction": count.direction.value,
+                "invalidation": float(count.invalidation_level),
+                "guideline_score": int(getattr(count, "guideline_score", 0)),
+            }
+
+        out = _ser(pref)
+        # v3.3: surface the ALTERNATE count (ranked lower by guideline score) so
+        # the scanner can price count-uncertainty instead of hiding it.
+        alt = getattr(res, "alternate", None)
+        if alt is not None:
+            out["alternate"] = _ser(alt)
+            out["preferred_reason"] = (
+                f"preferred satisfies {out['guideline_score']} guidelines vs "
+                f"{out['alternate']['guideline_score']} for the alternate")
+        return out
     except Exception as exc:  # noqa: BLE001
         logger.debug("elliott context skipped: %s", exc)
         return None
@@ -1056,7 +1280,11 @@ def score_setup(symbol, region, closes, highs, lows, *,
                 event_context: Optional[dict] = None,
                 volumes: Optional[list] = None,
                 market_regime: Optional[dict] = None,
-                fundamentals: Optional[dict] = None):
+                fundamentals: Optional[dict] = None,
+                news_context: Optional[dict] = None,
+                sector_context: Optional[dict] = None,
+                fx_context: Optional[dict] = None,
+                spread_quote: Optional[dict] = None):
     """Score a single instrument into a SetupResult, or None if data insufficient.
 
     region is a display bucket ('Swedish' | 'International').
@@ -1146,6 +1374,12 @@ def score_setup(symbol, region, closes, highs, lows, *,
     fibp = _fib_price_levels(pivots, price, atr, target)
     pf = _pitchfork_state(pivots, price, atr, len(closes) - 1)
     vol_state = _volume_state(volumes, breakout)
+    # v3.3 components
+    obv = _obv_state(closes, volumes)
+    prz_vol = _prz_touch_volume((technical_context or {}).get("harmonics", []),
+                                highs, lows, volumes, atr)
+    news_comp = _news_component(news_context)
+    sector_comp = _sector_component(sector_context)
 
     # -- corporate-event gap risk (earnings / ex-dividend inside the window) --
     event_conflicts, events_summary = _event_flags(
@@ -1218,6 +1452,10 @@ def score_setup(symbol, region, closes, highs, lows, *,
     if market_regime is not None:
         _comp("market_regime",
               W_REGIME if market_regime.get("risk_on") else 0.0, W_REGIME)
+    if news_comp is not None:
+        _comp("news", news_comp["earned"], W_NEWS)
+    if sector_comp is not None:
+        _comp("sector_relative_strength", sector_comp["earned"], W_SECTOR)
     # bonus: displayed in sub_scores, excluded from normalization
     sub["monthly_rsi_reversal_bonus"] = (
         B_MONTHLY_OVERSOLD
@@ -1296,6 +1534,42 @@ def score_setup(symbol, region, closes, highs, lows, *,
         conflicts.append(
             f"market regime risk-off: {market_regime.get('index', 'index')} below "
             "its 200-day MA - bullish setups fight the tape")
+    # v3.3 evidence
+    if obv is not None:
+        if obv["rising"]:
+            supports.append("OBV rising (accumulation)")
+        elif aligned >= 2:
+            conflicts.append("OBV falling while price trends up (distribution divergence)")
+    if prz_vol is not None:
+        if prz_vol.get("confirmed"):
+            supports.append(
+                f"bullish {prz_vol['pattern']} PRZ touch on "
+                f"{prz_vol['volume_ratio']}x volume (confirmation)")
+        elif prz_vol.get("rejection"):
+            conflicts.append(
+                f"bearish {prz_vol['pattern']} PRZ touch on "
+                f"{prz_vol['volume_ratio']}x volume (rejection risk)")
+    if news_comp is not None:
+        if news_comp["conflict"]:
+            conflicts.append(news_comp["conflict"])
+        elif news_comp["sentiment"]["label"] == "positive":
+            supports.append(
+                f"news flow positive ({news_comp['sentiment']['n_scored']} items, "
+                "lexicon-derived)")
+    if sector_comp is not None:
+        if sector_comp["label"] == "sector leader":
+            supports.append(f"outperforming sector proxy {sector_comp['proxy']} "
+                            "on all measured windows")
+        elif sector_comp["label"] == "sector laggard":
+            conflicts.append(f"lagging sector proxy {sector_comp['proxy']} "
+                             "on all measured windows")
+    ell_ctx = (technical_context or {}).get("elliott") or {}
+    ell_alt = ell_ctx.get("alternate")
+    if ell_alt and ell_alt.get("direction") != ell_ctx.get("direction"):
+        conflicts.append(
+            f"Elliott alternate count ({ell_alt.get('direction', '?').lower()} "
+            f"{ell_alt.get('structure', '')}) contradicts the preferred count - "
+            "count uncertainty")
 
     # -- penalties --
     pen: dict = {}
@@ -1316,6 +1590,26 @@ def score_setup(symbol, region, closes, highs, lows, *,
     if vol_state is not None and len(closes) >= 21:
         turnover_20d = sum(c * v for c, v in zip(closes[-20:], volumes[-20:])) / 20
         pen["liquidity_penalty"] = LIQ_PENALTY if turnover_20d < LIQ_MIN_TURNOVER else 0.0
+
+    # v3.3: execution-cost (spread) model - real bid/ask when supplied, else proxy.
+    spread = _spread_model(price, atr, turnover_20d, asset_class,
+                           bool(proxy_note),
+                           bid=(spread_quote or {}).get("bid"),
+                           ask=(spread_quote or {}).get("ask"))
+    if spread is not None and spread["wide"]:
+        pen["spread_penalty"] = SPREAD_PENALTY
+        conflicts.append(
+            f"wide spread ~{spread['spread_pct']}% ({spread['spread_source']}) - "
+            "execution cost eats into the 2:1 reward:risk")
+
+    # v3.3: FX risk on non-reporting-currency instruments (unhedged exposure).
+    if fx_context is not None:
+        fx_vol = fx_context.get("vol_ann_pct")
+        if isinstance(fx_vol, (int, float)) and fx_vol >= FX_VOL_PENALTY_AT:
+            pen["fx_risk_penalty"] = FX_PENALTY
+            conflicts.append(
+                f"elevated FX volatility ({fx_context.get('pair')} "
+                f"~{fx_vol:.0f}% ann.) on an unhedged non-SEK instrument")
 
     # Dynamic normalization: score over the components whose data exists.
     raw = sum(v for k, v in sub.items() if k in sub_max)
@@ -1389,6 +1683,23 @@ def score_setup(symbol, region, closes, highs, lows, *,
         pitchfork=pf,
         fundamentals_notes=fund_notes or None,
         liquidity_turnover_20d=(round(turnover_20d) if turnover_20d is not None else None),
+        # v3.3
+        news=({"score": news_comp["earned"], "max": W_NEWS,
+               "sentiment": news_comp["sentiment"], "source": news_comp["source"],
+               "as_of": news_comp["as_of"],
+               "top_items": (news_context or {}).get("items", [])[:4]}
+              if news_comp else None),
+        sector_relative_strength=sector_comp,
+        spread=spread,
+        fx=fx_context,
+        obv=obv,
+        prz_volume=prz_vol,
+        elliott_preferred=({k: v for k, v in ell_ctx.items() if k != "alternate"}
+                           if ell_ctx else None),
+        elliott_alternates=([ell_alt] if ell_alt else []),
+        intraday={"intraday_available": False,
+                  "fallback_reason": "intraday refinement runs for selected "
+                                     "finalists only (see router)"},
         conflicts=conflicts, supports=supports,
         strongest_supporting=strongest_sup, strongest_opposing=strongest_opp,
         data_quality={"daily_bars": len(closes),
@@ -1432,8 +1743,16 @@ def score_setup(symbol, region, closes, highs, lows, *,
             "holiday_calendar": not cal_days,
             "crypto_calendar_days": cal_days,
             "liquidity_screen": turnover_20d is not None,
-            # honest gaps (see CLAUDE.md "Additional factors"):
-            "news_in_score": False,
+            # v3.3: dynamic
+            "news_in_score": news_comp is not None,
+            "news_sentiment_licensed": False,   # lexicon-derived only, honest
+            "sector_relative_strength": sector_comp is not None,
+            "spread_model": spread is not None,
+            "spread_real_quote": bool(spread and spread["spread_model_type"] == "quote"),
+            "fx_context": fx_context is not None,
+            "obv": obv is not None,
+            "prz_touch_volume": prz_vol is not None,
+            "elliott_alternates": bool(ell_alt),
         },
         debug={
             "raw_score": round(base_score, 1),

@@ -588,3 +588,165 @@ def test_liquidity_penalty_for_thin_turnover():
     deep = [1_000_000.0] * len(closes)
     r2 = score_setup("DEEP.ST", "Swedish", closes, highs, lows, volumes=deep)
     assert r2["penalties"]["liquidity_penalty"] == 0.0
+
+
+# ── v3.3: news sentiment, sector RS, spread, FX, OBV/PRZ, Elliott alternates,
+#          intraday refinement ───────────────────────────────────────────────
+
+def _news(items):
+    return {"items": items, "source": "test", "as_of": "2026-07-09"}
+
+
+def test_news_lexicon_positive_negative_stale():
+    from api.setup_scanner import news_sentiment
+    pos = news_sentiment([{"title": "Company beats estimates, raises guidance",
+                           "age_days": 2}])
+    assert pos["label"] == "positive" and pos["method"] == "lexicon (model-derived)"
+    neg = news_sentiment([{"title": "Profit warning and layoffs announced",
+                           "age_days": 3}])
+    assert neg["label"] == "negative"
+    stale = news_sentiment([{"title": "Company beats estimates", "age_days": 40}])
+    assert stale["n_scored"] == 0                       # stale news ignored
+    none_ = news_sentiment([{"title": "Quarterly report published", "age_days": 2}])
+    assert none_["n_scored"] == 0                       # no lexicon hits = unscored
+
+
+def test_news_score_moves_final_score_bounded():
+    closes, highs, lows = trend_series()
+    base = score_setup("X", "Swedish", closes, highs, lows)
+    up = score_setup("X", "Swedish", closes, highs, lows, news_context=_news(
+        [{"title": "record growth, contract wins, guidance raised", "age_days": 1}]))
+    down = score_setup("X", "Swedish", closes, highs, lows, news_context=_news(
+        [{"title": "fraud probe, lawsuit, profit warning", "age_days": 1}]))
+    assert up["score"] > down["score"]
+    assert any("negative" in c for c in down["conflicts"])
+    assert abs(up["score"] - base["score"]) < 5          # bounded: news never dominates
+    assert base["compliance"]["news_in_score"] is False
+    assert up["compliance"]["news_in_score"] is True
+    assert up["compliance"]["news_sentiment_licensed"] is False   # honest
+
+
+def test_sector_relative_strength_component():
+    from api.setup_scanner import _sector_component, W_SECTOR
+    lead = _sector_component({"proxy": "XLI", "rel_1m": 0.02, "rel_3m": 0.04, "rel_6m": 0.01})
+    assert lead["earned"] == W_SECTOR and lead["label"] == "sector leader"
+    lag = _sector_component({"proxy": "XLI", "rel_1m": -0.02, "rel_3m": -0.04, "rel_6m": -0.01})
+    assert lag["earned"] == 0.0 and lag["label"] == "sector laggard"
+    assert _sector_component(None) is None
+    assert _sector_component({"proxy": "XLI"}) is None   # no windows = not counted
+
+
+def test_sector_laggard_penalises_leader_rewards():
+    closes, highs, lows = trend_series()
+    lead = score_setup("X", "Swedish", closes, highs, lows, sector_context={
+        "proxy": "XLI", "rel_1m": 0.02, "rel_3m": 0.04, "rel_6m": 0.01})
+    lag = score_setup("X", "Swedish", closes, highs, lows, sector_context={
+        "proxy": "XLI", "rel_1m": -0.02, "rel_3m": -0.04, "rel_6m": -0.01})
+    assert lead["score"] > lag["score"]
+    assert any("lagging sector" in c for c in lag["conflicts"])
+
+
+def test_spread_model_real_quote_and_proxy():
+    from api.setup_scanner import _spread_model
+    real = _spread_model(100.0, 2.0, 50e6, "equity", False, bid=99.95, ask=100.05)
+    assert real["spread_model_type"] == "quote"
+    assert abs(real["spread_pct"] - 0.1) < 0.01
+    proxy = _spread_model(100.0, 2.0, 500_000, "equity", True)
+    assert proxy["spread_model_type"] == "proxy"
+    assert proxy["spread_pct"] > real["spread_pct"]      # thin proxy wider than liquid quote
+    assert _spread_model(100.0, 2.0, None, "equity", False) is None
+
+
+def test_wide_spread_penalises():
+    from api.setup_scanner import _spread_model
+    closes, highs, lows = trend_series()
+    thin = [200.0] * len(closes)                          # tiny turnover -> wide proxy spread
+    r = score_setup("THIN.ST", "Swedish", closes, highs, lows, volumes=thin)
+    assert r["spread"] is not None
+    if r["spread"]["wide"]:
+        assert r["penalties"].get("spread_penalty", 0) > 0
+        assert any("spread" in c for c in r["conflicts"])
+
+
+def test_fx_high_volatility_penalises_and_low_does_not():
+    closes, highs, lows = trend_series()
+    hot = score_setup("COPA.L", "Swedish", closes, highs, lows, fx_context={
+        "pair": "USDSEK", "rate": 9.5, "vol_ann_pct": 12.0})
+    calm = score_setup("COPA.L", "Swedish", closes, highs, lows, fx_context={
+        "pair": "USDSEK", "rate": 9.5, "vol_ann_pct": 5.0})
+    assert hot["penalties"].get("fx_risk_penalty", 0) > 0
+    assert calm["penalties"].get("fx_risk_penalty", 0) == 0
+    assert hot["fx"]["pair"] == "USDSEK"
+    none_ = score_setup("X.ST", "Swedish", closes, highs, lows)
+    assert none_["fx"] is None and none_["compliance"]["fx_context"] is False
+
+
+def test_obv_rising_supports_falling_conflicts():
+    from api.setup_scanner import _obv_state
+    n = 100
+    closes = [100 + i * 0.5 for i in range(n)]
+    up_vols = [1000.0 + i * 10 for i in range(n)]
+    obv_up = _obv_state(closes, up_vols)
+    assert obv_up["rising"] is True                       # all up-days: OBV climbs
+    # price up but volume concentrated on down bars -> craft alternating series
+    closes2 = []
+    for i in range(n):
+        closes2.append(100 + i * 0.1 + (0.8 if i % 2 == 0 else 0.0))
+    vols2 = [5000.0 if closes2[i] < closes2[i - 1] else 100.0 for i in range(n)]
+    obv_dn = _obv_state(closes2, vols2)
+    assert obv_dn["rising"] is False
+    assert _obv_state(closes, None) is None
+    assert _obv_state(closes, [0.0] * n) is None
+
+
+def test_prz_touch_volume_confirmation_and_rejection():
+    from api.setup_scanner import _prz_touch_volume
+    n = 60
+    highs = [101.0] * n
+    lows = [99.0] * n
+    vols = [1000.0] * (n - 1) + [1800.0]                  # 1.8x on the touch bar
+    bull = [{"name": "GARTLEY", "bullish": True, "d_price": 100.0, "age_bars": 3}]
+    c = _prz_touch_volume(bull, highs, lows, vols, atr=1.0)
+    assert c["confirmed"] is True and c["rejection"] is False
+    bear = [{"name": "BUTTERFLY", "bullish": False, "d_price": 100.0, "age_bars": 3}]
+    r = _prz_touch_volume(bear, highs, lows, vols, atr=1.0)
+    assert r["rejection"] is True
+    assert _prz_touch_volume(bull, highs, lows, None, 1.0) is None
+
+
+def test_elliott_alternate_surfaced_and_contradiction_flagged():
+    closes, highs, lows = trend_series()
+    ctx = {"harmonics": [], "elliott": {
+        "structure": "IMPULSE", "status": "IN_PROGRESS", "direction": "BULLISH",
+        "current_wave": "Wave 3", "guideline_score": 5,
+        "alternate": {"structure": "ZIGZAG", "status": "IN_PROGRESS",
+                      "direction": "BEARISH", "current_wave": "Wave C",
+                      "invalidation": 90.0, "guideline_score": 2}}}
+    r = score_setup("X", "Swedish", closes, highs, lows, technical_context=ctx)
+    assert r["elliott_preferred"]["structure"] == "IMPULSE"
+    assert r["elliott_alternates"] and r["elliott_alternates"][0]["structure"] == "ZIGZAG"
+    assert any("alternate count" in c for c in r["conflicts"])
+    assert r["compliance"]["elliott_alternates"] is True
+    # agreeing alternate: no contradiction conflict
+    ctx2 = {"harmonics": [], "elliott": dict(ctx["elliott"],
+            alternate=dict(ctx["elliott"]["alternate"], direction="BULLISH"))}
+    r2 = score_setup("X", "Swedish", closes, highs, lows, technical_context=ctx2)
+    assert not any("alternate count" in c for c in r2["conflicts"])
+
+
+def test_intraday_refiner_math_and_fallbacks():
+    import math as _m
+    from api.setup_scanner import refine_target_time_intraday
+    ic = [100 + 0.1 * i + 0.5 * _m.sin(i / 3) for i in range(300)]
+    ih = [c + 0.3 for c in ic]
+    il = [c - 0.3 for c in ic]
+    r = refine_target_time_intraday("2026-07-21", 6.0, ih, il, ic, 8.5, "Europe/Stockholm")
+    assert r["intraday_available"] is True
+    assert "2026-07-21" in r["expected_target_datetime"]
+    assert "intraday estimate" in r["expected_target_datetime"]
+    assert r["target_time_basis"].startswith("intraday")
+    short = refine_target_time_intraday("2026-07-21", 6.0, ih[:10], il[:10], ic[:10], 8.5)
+    assert short["intraday_available"] is False and "insufficient" in short["fallback_reason"]
+    flat = refine_target_time_intraday("2026-07-21", 6.0, [100.0] * 60, [100.0] * 60,
+                                       [100.0] * 60, 8.5)
+    assert flat["intraday_available"] is False and "flat" in flat["fallback_reason"]
