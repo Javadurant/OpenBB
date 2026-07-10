@@ -795,8 +795,48 @@ def _fetch_and_score(entry: tuple[str, str, str],
         return None
 
 
+def _structured_error(code: str, exc: Exception, source: str, rid: str):
+    """Local-dev reliability contract: routes must NEVER surface as a bare
+    'Failed to fetch' — they return this JSON error envelope instead."""
+    from datetime import datetime as _dt, timezone as _tz
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=503, content={
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": str(exc)[:300],
+            "details": type(exc).__name__,
+            "retryable": True,
+            "source": source,
+            "timestamp": _dt.now(_tz.utc).isoformat(timespec="seconds"),
+            "request_id": rid,
+        },
+    })
+
+
 @router.get("/api/discover/setup-of-the-day")
-def setup_of_the_day(refresh: bool = False) -> dict[str, Any]:
+def setup_of_the_day(refresh: bool = False):
+    """Reliability wrapper: structured JSON errors + stale-cache fallback.
+    A live-scan failure serves the last good scan (flagged stale) before it
+    ever serves an error - the Setup of the Day section must never go blank."""
+    import uuid as _uuid
+    rid = _uuid.uuid4().hex[:12]
+    try:
+        return _setup_of_the_day_impl(refresh)
+    except Exception as exc:  # noqa: BLE001 - contract: never crash unstructured
+        logger.exception("setup-of-the-day failed [request_id=%s]", rid)
+        if _SETUP_CACHE.get("data") is not None:
+            stale = dict(_SETUP_CACHE["data"])
+            stale["cached"] = True
+            stale["stale"] = True
+            stale["stale_reason"] = (f"live scan failed ({type(exc).__name__}); "
+                                     "serving last successful scan")
+            stale["request_id"] = rid
+            return stale
+        return _structured_error("SETUP_SCAN_FAILED", exc, "setup_scanner", rid)
+
+
+def _setup_of_the_day_impl(refresh: bool = False) -> dict[str, Any]:
     """
     The Setup Scanner — best-qualifying setup per (region × asset class).
 
@@ -932,25 +972,32 @@ def setup_of_the_day(refresh: bool = False) -> dict[str, Any]:
 
 
 @router.get("/api/discover/ledger")
-async def discover_ledger(evaluate: bool = False) -> dict[str, Any]:  # <- NEW [Phase3-Step3]: trust ledger
+async def discover_ledger(evaluate: bool = False):  # <- NEW [Phase3-Step3]: trust ledger
     """Honest hit-rate track record for surfaced setups: win-rate by grade with
     sample size + methodology + disclaimer. Pass ?evaluate=true to resolve
-    newly-matured PENDING entries against subsequent price action first."""
-    from .setup_ledger import (aggregate as _aggregate,
-                               evaluate_open_entries as _evaluate,
-                               timing_calibration as _timing_calib)
-    if evaluate:
-        from .data_ingestion import service as _ingest
-        try:
-            await _evaluate(_ingest)
-        except Exception:  # noqa: BLE001 - never let evaluation break the read
-            logger.warning("ledger evaluation failed", exc_info=True)
-    result = _aggregate()
+    newly-matured PENDING entries against subsequent price action first.
+    Reliability wrapper: structured JSON errors, isolated from setup-of-the-day."""
+    import uuid as _uuid
+    rid = _uuid.uuid4().hex[:12]
     try:
-        result["timing_calibration"] = _timing_calib()  # v3: time-to-target calibration
-    except Exception:  # noqa: BLE001
-        logger.warning("timing calibration failed", exc_info=True)
-    return result
+        from .setup_ledger import (aggregate as _aggregate,
+                                   evaluate_open_entries as _evaluate,
+                                   timing_calibration as _timing_calib)
+        if evaluate:
+            from .data_ingestion import service as _ingest
+            try:
+                await _evaluate(_ingest)
+            except Exception:  # noqa: BLE001 - never let evaluation break the read
+                logger.warning("ledger evaluation failed", exc_info=True)
+        result = _aggregate()
+        try:
+            result["timing_calibration"] = _timing_calib()  # v3: time-to-target calibration
+        except Exception:  # noqa: BLE001
+            logger.warning("timing calibration failed", exc_info=True)
+        return result
+    except Exception as exc:  # noqa: BLE001 - contract: never crash unstructured
+        logger.exception("discover/ledger failed [request_id=%s]", rid)
+        return _structured_error("LEDGER_READ_FAILED", exc, "setup_ledger", rid)
 
 
 @router.get("/api/ai/providers")
