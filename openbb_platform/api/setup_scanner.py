@@ -159,15 +159,33 @@ NEWS_STALE_DAYS:    Final = 21
 # Deterministic financial-news lexicon (model-derived sentiment - honest,
 # lower-confidence substitute while no licensed sentiment feed is configured).
 NEWS_POSITIVE_WORDS: Final = frozenset({
+    # English
     "beat", "beats", "raise", "raises", "raised", "upgrade", "upgraded",
     "record", "growth", "surge", "surges", "wins", "win", "contract",
     "buyback", "dividend increase", "outperform", "strong", "profit rise",
-    "expands", "expansion", "partnership", "approval", "approved"})
+    "expands", "expansion", "partnership", "approval", "approved",
+    # Swedish (Avanza/Placera coverage - v3.4)
+    "höjer riktkurs", "slår förväntningar", "stark efterfrågan", "orderingång",
+    "förvärv", "återköp", "höjer utdelning", "vinstlyft", "rekordkvartal",
+    "uppgradering", "stororder", "höjer prognos"})
 NEWS_NEGATIVE_WORDS: Final = frozenset({
+    # English
     "miss", "misses", "cut", "cuts", "downgrade", "downgraded", "probe",
     "lawsuit", "investigation", "recall", "warning", "warns", "profit warning",
     "layoff", "layoffs", "fraud", "decline", "falls", "plunge", "plunges",
-    "weak", "loss", "losses", "bankruptcy", "default", "strike", "slump"})
+    "weak", "loss", "losses", "bankruptcy", "default", "strike", "slump",
+    # Swedish (Avanza/Placera coverage - v3.4)
+    "vinstvarning", "sänker riktkurs", "missar förväntningar",
+    "svag efterfrågan", "stämning", "utredning", "marginalpress",
+    "sänker prognos", "nedgradering", "varsel", "vd lämnar", "vd-byte",
+    "skuldsättning"})
+# Headlines containing these set an EVENT-RISK flag (report/guidance risk),
+# independent of sentiment sign. Bilingual.
+NEWS_EVENT_RISK_WORDS: Final = frozenset({
+    "earnings", "quarterly report", "guidance", "profit warning",
+    "rapport", "kvartalsrapport", "vinstvarning", "prognos", "utdelning",
+    "dividend", "ex-dividend", "agm", "årsstämma", "kapitalmarknadsdag",
+    "investor day"})
 SPREAD_WIDE_PCT:    Final = 0.01   # >1% spread = wide, execution-risk penalty
 SPREAD_PENALTY:     Final = 2.0
 FX_VOL_PENALTY_AT:  Final = 8.0    # annualised FX vol above this (%) = penalty
@@ -630,13 +648,20 @@ def news_sentiment(items: list) -> dict:
         weighted += w * s
         total_w += w
         scored += 1
+    event_risk = any(
+        w in ((it.get("title") or "") + " " + (it.get("summary") or "")).lower()
+        for it in (items or [])
+        for w in NEWS_EVENT_RISK_WORDS
+        if (it.get("age_days") is not None and it["age_days"] <= NEWS_STALE_DAYS))
     if scored == 0:
         return {"score": 0.0, "label": "neutral/none", "n_scored": 0,
-                "method": "lexicon (model-derived)", "confidence": "none"}
+                "method": "lexicon (model-derived)", "confidence": "none",
+                "event_risk": event_risk}
     s = weighted / total_w
     label = "positive" if s > 0.2 else "negative" if s < -0.2 else "neutral"
     return {"score": round(s, 2), "label": label, "n_scored": scored,
-            "method": "lexicon (model-derived)", "confidence": "low"}
+            "method": "lexicon (model-derived)", "confidence": "low",
+            "event_risk": event_risk}
 
 
 def _news_component(news_context: Optional[dict]) -> Optional[dict]:
@@ -1565,11 +1590,20 @@ def score_setup(symbol, region, closes, highs, lows, *,
                              "on all measured windows")
     ell_ctx = (technical_context or {}).get("elliott") or {}
     ell_alt = ell_ctx.get("alternate")
+    uncertainty_flags: list = []
     if ell_alt and ell_alt.get("direction") != ell_ctx.get("direction"):
-        conflicts.append(
+        # v3.4 DEMOTION (backtest-evidenced, 2026-07-11, n=504): this fired in
+        # 83% of entries and saturated the Conflicted label, making the
+        # conflict count non-monotone (2-conflict bucket hit 28.4% vs 37.0% at
+        # 3+). An alternate count with opposite direction is NORMAL Elliott
+        # ambiguity, not hard contra-evidence - the engine always publishes an
+        # alternate when one is valid. Demoted to an informational uncertainty
+        # flag: fully visible (field + debug), never scored, never counted.
+        # A hard bearish PREFERRED count still penalizes via _context_conflicts.
+        uncertainty_flags.append(
             f"Elliott alternate count ({ell_alt.get('direction', '?').lower()} "
             f"{ell_alt.get('structure', '')}) contradicts the preferred count - "
-            "count uncertainty")
+            "count uncertainty (informational, not scored)")
 
     # -- penalties --
     pen: dict = {}
@@ -1697,6 +1731,7 @@ def score_setup(symbol, region, closes, highs, lows, *,
         elliott_preferred=({k: v for k, v in ell_ctx.items() if k != "alternate"}
                            if ell_ctx else None),
         elliott_alternates=([ell_alt] if ell_alt else []),
+        uncertainty_flags=uncertainty_flags,   # v3.4: visible, never scored
         intraday={"intraday_available": False,
                   "fallback_reason": "intraday refinement runs for selected "
                                      "finalists only (see router)"},

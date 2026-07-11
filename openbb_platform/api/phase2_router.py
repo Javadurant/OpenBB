@@ -703,6 +703,15 @@ def _candidate_news(sym: str, asset_class: str, as_of: str) -> Optional[dict]:
     yfinance source works for .ST symbols too, unlike FMP's thin Nordic feed)."""
     if asset_class not in ("equity", "etf"):
         return None
+    # v3.4: FMP first when the server env has a key (verified US coverage;
+    # .ST returns empty on FMP), yfinance fallback covers Nordic names.
+    try:
+        from .fmp_news import fetch_fmp_news
+        fmp = fetch_fmp_news(sym)
+        if fmp is not None:
+            return fmp
+    except Exception:  # noqa: BLE001 - adapter is optional
+        pass
     nc = _news_context(sym)
     if not nc or not nc.get("headlines"):
         return None

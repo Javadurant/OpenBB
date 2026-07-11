@@ -714,7 +714,10 @@ def test_prz_touch_volume_confirmation_and_rejection():
     assert _prz_touch_volume(bull, highs, lows, None, 1.0) is None
 
 
-def test_elliott_alternate_surfaced_and_contradiction_flagged():
+def test_elliott_alternate_contradiction_is_informational_not_scored():
+    """v3.4 demotion (backtest-evidenced, n=504): the alternate-contradiction
+    fired in 83% of entries and saturated 'Conflicted Buy Setup'. It must now
+    be VISIBLE (uncertainty_flags) but never scored, counted, or classifying."""
     closes, highs, lows = trend_series()
     ctx = {"harmonics": [], "elliott": {
         "structure": "IMPULSE", "status": "IN_PROGRESS", "direction": "BULLISH",
@@ -723,15 +726,31 @@ def test_elliott_alternate_surfaced_and_contradiction_flagged():
                       "direction": "BEARISH", "current_wave": "Wave C",
                       "invalidation": 90.0, "guideline_score": 2}}}
     r = score_setup("X", "Swedish", closes, highs, lows, technical_context=ctx)
+    plain = score_setup("X", "Swedish", closes, highs, lows,
+                        technical_context={"harmonics": [],
+                                           "elliott": {k: v for k, v in ctx["elliott"].items()
+                                                       if k != "alternate"}})
     assert r["elliott_preferred"]["structure"] == "IMPULSE"
     assert r["elliott_alternates"] and r["elliott_alternates"][0]["structure"] == "ZIGZAG"
-    assert any("alternate count" in c for c in r["conflicts"])
+    # visible but NOT a conflict, NOT scored, NOT classification-changing
+    assert any("alternate count" in f for f in r["uncertainty_flags"])
+    assert not any("alternate count" in c for c in r["conflicts"])
+    assert r["score"] == plain["score"]
+    assert r["classification"] == plain["classification"]
+    assert r["classification"] != "Conflicted Buy Setup"
     assert r["compliance"]["elliott_alternates"] is True
-    # agreeing alternate: no contradiction conflict
+    # a hard BEARISH PREFERRED count still penalizes strongly (unchanged rule)
+    bear = {"harmonics": [], "elliott": {
+        "structure": "IMPULSE", "status": "IN_PROGRESS",
+        "direction": "BEARISH", "current_wave": "Wave 3"}}
+    rb = score_setup("X", "Swedish", closes, highs, lows, technical_context=bear)
+    assert any("bearish IMPULSE" in c for c in rb["conflicts"])
+    assert rb["score"] < plain["score"]
+    # agreeing alternate: no flag at all
     ctx2 = {"harmonics": [], "elliott": dict(ctx["elliott"],
             alternate=dict(ctx["elliott"]["alternate"], direction="BULLISH"))}
     r2 = score_setup("X", "Swedish", closes, highs, lows, technical_context=ctx2)
-    assert not any("alternate count" in c for c in r2["conflicts"])
+    assert r2["uncertainty_flags"] == []
 
 
 def test_intraday_refiner_math_and_fallbacks():
