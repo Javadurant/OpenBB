@@ -633,18 +633,26 @@ def news_sentiment(items: list) -> dict:
     'lexicon (model-derived)' - lower confidence than a licensed feed."""
     total_w, weighted = 0.0, 0.0
     scored = 0
+    licensed_n = 0
     for it in items or []:
         age = it.get("age_days")
         if age is None or age > NEWS_STALE_DAYS:
             continue
         w = 1.0 if age <= NEWS_FRESH_DAYS else \
             max(0.0, 1.0 - (age - NEWS_FRESH_DAYS) / (NEWS_STALE_DAYS - NEWS_FRESH_DAYS))
-        text = ((it.get("title") or "") + " " + (it.get("summary") or "")).lower()
-        pos = sum(1 for wrd in NEWS_POSITIVE_WORDS if wrd in text)
-        neg = sum(1 for wrd in NEWS_NEGATIVE_WORDS if wrd in text)
-        if pos == 0 and neg == 0:
-            continue
-        s = (pos - neg) / max(1, pos + neg)
+        # v3.6: LICENSED per-item sentiment (e.g. Polygon insights) beats the
+        # lexicon when present - it's per-ticker and professionally labelled.
+        lic = it.get("sentiment")
+        if lic in ("positive", "negative", "neutral"):
+            s = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}[lic]
+            licensed_n += 1
+        else:
+            text = ((it.get("title") or "") + " " + (it.get("summary") or "")).lower()
+            pos = sum(1 for wrd in NEWS_POSITIVE_WORDS if wrd in text)
+            neg = sum(1 for wrd in NEWS_NEGATIVE_WORDS if wrd in text)
+            if pos == 0 and neg == 0:
+                continue
+            s = (pos - neg) / max(1, pos + neg)
         weighted += w * s
         total_w += w
         scored += 1
@@ -655,12 +663,19 @@ def news_sentiment(items: list) -> dict:
         if (it.get("age_days") is not None and it["age_days"] <= NEWS_STALE_DAYS))
     if scored == 0:
         return {"score": 0.0, "label": "neutral/none", "n_scored": 0,
+                "n_licensed": 0,
                 "method": "lexicon (model-derived)", "confidence": "none",
                 "event_risk": event_risk}
     s = weighted / total_w
     label = "positive" if s > 0.2 else "negative" if s < -0.2 else "neutral"
+    if licensed_n == scored:
+        method, conf = "licensed per-ticker sentiment", "high"
+    elif licensed_n > 0:
+        method, conf = "mixed: licensed + lexicon", "medium"
+    else:
+        method, conf = "lexicon (model-derived)", "low"
     return {"score": round(s, 2), "label": label, "n_scored": scored,
-            "method": "lexicon (model-derived)", "confidence": "low",
+            "n_licensed": licensed_n, "method": method, "confidence": conf,
             "event_risk": event_risk}
 
 
@@ -1780,7 +1795,9 @@ def score_setup(symbol, region, closes, highs, lows, *,
             "liquidity_screen": turnover_20d is not None,
             # v3.3: dynamic
             "news_in_score": news_comp is not None,
-            "news_sentiment_licensed": False,   # lexicon-derived only, honest
+            # v3.6: True when licensed per-item sentiment (Polygon) was scored
+            "news_sentiment_licensed": bool(
+                news_comp and news_comp["sentiment"].get("n_licensed", 0) > 0),
             "sector_relative_strength": sector_comp is not None,
             "spread_model": spread is not None,
             "spread_real_quote": bool(spread and spread["spread_model_type"] == "quote"),

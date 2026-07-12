@@ -1067,7 +1067,7 @@ def _advisor_plan(verdict: str, score: int, price: float, atr: float,
 
 
 def _trade_ticket(symbol: str, price: float, final: str, conviction: int,
-                  tally: dict) -> dict[str, Any]:
+                  tally: dict, tech: Optional[dict] = None) -> dict[str, Any]:
     """Turn the Chairman's directional call into an executable trade ticket.
 
     Honest by construction:
@@ -1140,12 +1140,31 @@ def _trade_ticket(symbol: str, price: float, final: str, conviction: int,
         }
 
     long = final == "BUY"
-    if long:
+    # <- [COUNCIL-AUDIT v3.6]: technical evidence FIRST. When the Setup Scanner
+    #    produced levels (entry/invalidation/target from ATR + structure +
+    #    conflicts), a BUY ticket consumes THOSE, and board conviction affects
+    #    only sizing/psychology - never the levels. This closes the SKF-B.ST
+    #    audit finding (levels were pure conviction-scaled ATR arithmetic).
+    scanner_grounded = bool(long and tech and tech.get("entry")
+                            and tech.get("target") and tech.get("invalidation"))
+    if scanner_grounded:
+        entry = round(float(tech["entry"]), 2)
+        stop = round(float(tech["invalidation"]), 2)
+        target = round(float(tech["target"]), 2)
+        risk_ = max(0.01, entry - stop)
+        rr = round((target - entry) / risk_, 2)
+        level_basis = ("Setup Scanner levels (structure-derived entry/stop/target; "
+                       "board conviction affects sizing only)")
+    elif long:
         entry, stop = round(last, 2), round(last - 2 * atr, 2)
         target = round(last + expected_move, 2)
+        level_basis = ("conviction-scaled ATR arithmetic — NO scanner evidence "
+                       "was available for this symbol")
     else:  # SELL (short) — mirror
         entry, stop = round(last, 2), round(last + 2 * atr, 2)
         target = round(last - expected_move, 2)
+        level_basis = ("conviction-scaled ATR arithmetic — NO scanner evidence "
+                       "was available for this symbol")
 
     vetoed = rr < _MIN_RR
     # Conditional entry where R:R first clears the gate (same stop & target):
@@ -1166,7 +1185,11 @@ def _trade_ticket(symbol: str, price: float, final: str, conviction: int,
         "target_days": target_days,
         "entry_date": entry_date,               # <- NEW: trade-on date
         "stop": stop,
-        "stop_reason": "2×ATR(14) beyond entry — structure invalidation",
+        "stop_reason": ("Setup Scanner invalidation level (structure-derived)"
+                        if scanner_grounded
+                        else "2×ATR(14) beyond entry — structure invalidation"),
+        "level_basis": level_basis,             # <- [COUNCIL-AUDIT v3.6]: provenance
+        "scanner_grounded": scanner_grounded,
         "timeframe": "swing · ~1–3 weeks",
         "expected_rr": rr,
         "per_share_risk": per_share_risk,
@@ -1241,6 +1264,10 @@ def chairman(symbol: str) -> dict[str, Any]:
             return {"key": name, "display_name": fw["display_name"], "verdict": verdict,
                     "score": score, "thesis": thesis.strip()[:280],
                     "horizon": horizon,
+                    # [COUNCIL-AUDIT v3.6]: every member is explicitly a lens
+                    "basis": ("framework-inspired style lens (simulated critique "
+                              "from published writings; not a real review or "
+                              "endorsement by this investor)"),
                     "plan": _advisor_plan(verdict, score, price, _atr, horizon, _liq_shares)}
 
         with ThreadPoolExecutor(max_workers=10) as ex:
@@ -1256,8 +1283,10 @@ def chairman(symbol: str) -> dict[str, Any]:
         final, conviction, rationale = _chair_synthesis(
             company, symbol, price, board, tally, groq_key)
 
-        # Executable trade ticket (entry/stop/target/R:R/size-basis) + risk veto.
-        ticket = _trade_ticket(symbol, price, final, conviction, tally)
+        # Executable trade ticket + risk veto. [COUNCIL-AUDIT v3.6]: consumes
+        # Setup Scanner levels first; conviction arithmetic only as fallback.
+        ticket = _trade_ticket(symbol, price, final, conviction, tally,
+                               tech=tech_evidence)
 
         now = datetime.now(timezone.utc)
         return {
@@ -1269,8 +1298,21 @@ def chairman(symbol: str) -> dict[str, Any]:
             "technical_evidence": tech_evidence,   # Setup Scanner block (audit fix)
             "tally": tally, "board": board, "members": len(board),
             "ai_powered": bool(groq_key),
+            # [COUNCIL-AUDIT v3.6]: explicit source-integrity framing. The board
+            # members are SIMULATED style lenses built from each investor's
+            # PUBLISHED framework - the named investors did not review this
+            # security, gave no advice, and endorse nothing here.
+            "simulation_disclaimer": (
+                "The board applies framework-inspired STYLE LENSES derived from "
+                "each investor's published writings. These are simulated "
+                "critiques - not statements, reviews, or endorsements by the "
+                "named individuals. No quotes are theirs unless cited to a "
+                "published source. Levels come from the Setup Scanner's "
+                "technical evidence when available (see ticket.level_basis)."),
             "disclaimer": ("Synthesis of 10 published investor frameworks applied to live "
-                           "facts. Educational, not financial advice. Markets carry risk."),
+                           "facts. Simulated style analysis - the named investors did not "
+                           "review this security. Educational, not financial advice. "
+                           "Markets carry risk."),
         }
     except HTTPException:
         raise

@@ -733,8 +733,18 @@ def _candidate_news(sym: str, asset_class: str, as_of: str) -> Optional[dict]:
             sources.append("Avanza/Placera manual-copy")
     except Exception:  # noqa: BLE001 - optional source
         pass
-    # v3.4: FMP when the plan allows (verified plan-gated 402/403 on 2026-07-11;
-    # degrades to None), then yfinance fallback.
+    # v3.6: Polygon news with LICENSED per-ticker sentiment (live-verified
+    # 2026-07-12; US coverage - .ST degrades to None honestly).
+    try:
+        from .polygon_news import fetch_polygon_news
+        poly = fetch_polygon_news(sym)
+        if poly is not None:
+            items.extend(poly["items"])
+            sources.append(poly["source"])
+    except Exception:  # noqa: BLE001 - adapter is optional
+        pass
+    # v3.4: FMP when the plan allows (2026-07-12 re-probe: HTTP 401 - the .env
+    # value is a PLACEHOLDER; degrades to None), then yfinance fallback.
     try:
         from .fmp_news import fetch_fmp_news
         fmp = fetch_fmp_news(sym)

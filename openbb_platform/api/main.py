@@ -211,6 +211,12 @@ def ready() -> Dict[str, Any]:
         checks["fmp_capabilities"] = fmp_capabilities()
     except Exception as exc:  # noqa: BLE001
         checks["fmp_capabilities"] = {"error": str(exc)[:120]}
+    # v3.6: Polygon licensed-sentiment news capability (cached, secret-safe)
+    try:
+        from api.polygon_news import polygon_capabilities
+        checks["polygon_capabilities"] = polygon_capabilities()
+    except Exception as exc:  # noqa: BLE001
+        checks["polygon_capabilities"] = {"error": str(exc)[:120]}
     git_commit = None
     try:
         import subprocess as _sp
