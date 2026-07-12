@@ -204,6 +204,13 @@ def ready() -> Dict[str, Any]:
         "fmp": bool(_os.getenv("FMP_API_KEY", "").strip()),
         "groq": bool(_os.getenv("GROQ_API_KEY", "").strip()),
     }
+    # v3.5: FMP plan-gate capability (cached per process; booleans + HTTP
+    # reason only, never the key). First call probes 3 tiny endpoints.
+    try:
+        from api.fmp_news import fmp_capabilities
+        checks["fmp_capabilities"] = fmp_capabilities()
+    except Exception as exc:  # noqa: BLE001
+        checks["fmp_capabilities"] = {"error": str(exc)[:120]}
     git_commit = None
     try:
         import subprocess as _sp

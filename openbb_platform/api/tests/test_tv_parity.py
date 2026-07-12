@@ -20,7 +20,10 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 _REF_DIR = pathlib.Path(__file__).parent / "tv_reference"
-_CASES = sorted(_REF_DIR.glob("*.json"))
+# TEMPLATE-*.json are unfilled scaffolds from create_tv_reference_case - only
+# filled cases (renamed or created without the TEMPLATE- prefix) are compared.
+_CASES = sorted(p for p in _REF_DIR.glob("*.json")
+                if not p.name.startswith("TEMPLATE-"))
 
 DEFAULT_TOL = {"rsi_14": 1.5, "tenkan_pct": 0.2, "kijun_pct": 0.2}
 
@@ -38,8 +41,9 @@ def test_tv_reference_case(case_path):
     case = _load(case_path)
     o = case["ohlcv"]
     closes, highs, lows = o["closes"], o["highs"], o["lows"]
-    tv = case["tv_values"]
+    tv = {k: v for k, v in (case.get("tv_values") or {}).items() if v is not None}
     tol = {**DEFAULT_TOL, **case.get("tolerances", {})}
+    assert tv, f"{case_path.name}: no captured tv_values - fill the case or rename to TEMPLATE-*"
 
     if "rsi_14" in tv:
         ours = _rsi(closes)

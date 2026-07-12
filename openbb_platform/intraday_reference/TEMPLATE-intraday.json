@@ -1,0 +1,18 @@
+{
+  "symbol": "SKF-B.ST",
+  "exchange": "OMXSTO",
+  "timeframe": "15m",
+  "timezone": "Europe/Stockholm",
+  "source": "tradingview_export",
+  "capture_method": "csv_export | manual_copy",
+  "bars": [
+    {
+      "time": "2026-07-11T09:00",
+      "open": 0,
+      "high": 0,
+      "low": 0,
+      "close": 0,
+      "volume": 0
+    }
+  ]
+}

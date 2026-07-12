@@ -94,7 +94,33 @@ def main() -> int:
     p.add_argument("--timeframe", default="1D")
     p.add_argument("--out")
     p.add_argument("--validate")
+    p.add_argument("--list-fields", action="store_true")
+    p.add_argument("--instructions", action="store_true")
     a = p.parse_args()
+    if a.list_fields:
+        print("required metadata:", ", ".join(REQUIRED_META))
+        print("accepted tv_values:", ", ".join(KNOWN_VALUES))
+        print(f"ohlcv: closes/highs/lows arrays, equal length, >= {MIN_BARS} bars")
+        return 0
+    if a.instructions:
+        print(
+            "TradingView values-parity: exact steps (no coding needed)\n"
+            "1. TradingView Desktop -> open the symbol + timeframe (e.g. OMXSTO:SKF_B, 1D).\n"
+            "2. Add indicators to compare: Relative Strength Index, Ichimoku Cloud,\n"
+            "   MACD, Bollinger Bands.\n"
+            "3. Right-click chart -> enable the Data Window (Indicator Values).\n"
+            "4. Hover the LAST CLOSED bar; write down the bar date and each value.\n"
+            "5. Export/copy >= 80 OHLCV bars for the SAME chart (TradingView:\n"
+            "   chart menu -> Export chart data, or copy from the data window).\n"
+            "6. Create the template:\n"
+            "   venv/bin/python -m api.tools.create_tv_reference_case --symbol SKF-B.ST --timeframe 1D\n"
+            "7. Edit the printed JSON file: fill ohlcv arrays + tv_values;\n"
+            "   delete tv_values keys you did not capture.\n"
+            "8. Validate:\n"
+            "   venv/bin/python -m api.tools.create_tv_reference_case --validate api/tests/tv_reference/SKF-B.ST-1D.json\n"
+            "9. Run parity:\n"
+            "   venv/bin/python -m pytest api/tests/test_tv_parity.py -q")
+        return 0
     if a.validate:
         return validate(a.validate)
     if not a.symbol:

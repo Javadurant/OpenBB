@@ -40,6 +40,36 @@ INTL = ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AVGO", "JPM", "V",
 RETURN_HORIZONS = (1, 3, 5, 9, 18, 24, 30)
 
 
+def conflict_type(c: str) -> str:
+    """Map a conflict STRING to a stable type key (analysis-side only - the
+    scanner's wording is the contract; scoring is untouched by this mapper)."""
+    s = c.lower()
+    if "earnings report" in s:                       return "earnings_window"
+    if "ex-dividend" in s:                           return "exdiv_window"
+    if "tenkan-sen below" in s:                      return "ichimoku_tk_cross"
+    if "cloud is red" in s:                          return "ichimoku_red_cloud"
+    if "below the ichimoku cloud" in s:              return "ichimoku_below_cloud"
+    if "kijun catch-up" in s or "magnet" in s:       return "kijun_catchup"
+    if "macd" in s:                                  return "macd_fading"
+    if "100-day" in s:                               return "below_ma100"
+    if "monthly trend" in s:                         return "monthly_down"
+    if "weekly trend" in s:                          return "weekly_down"
+    if "above entry band" in s:                      return "rsi_overbought"
+    if "bearish" in s and "atr of price" in s:       return "harmonic_bearish_near"
+    if "elliott" in s and "argues against" in s:     return "elliott_bearish_preferred"
+    if "elliott" in s and "exhausted" in s:          return "elliott_bullish_complete"
+    if "late-stage" in s:                            return "elliott_wave5"
+    if "resistance" in s:                            return "overhead_resistance"
+    if "regime" in s:                                return "regime_risk_off"
+    if "spread" in s:                                return "wide_spread"
+    if "obv" in s:                                   return "obv_divergence"
+    if "prz touch" in s or "rejection risk" in s:    return "prz_rejection"
+    if "news" in s:                                  return "news_negative"
+    if "lagging sector" in s:                        return "sector_laggard"
+    if "fx volatility" in s:                         return "fx_vol"
+    return "other"
+
+
 def _mondays(n: int, last: date) -> list[date]:
     d = last
     while d.weekday() != 0:
@@ -124,6 +154,8 @@ def main() -> None:
                 "score": r["score"], "risk_level": r["risk_level"],
                 "n_conflicts": len(r.get("conflicts", [])),
                 "sub_scores": r["sub_scores"], "penalties": r["penalties"],
+                "conflict_types": sorted({conflict_type(c) for c in r.get("conflicts", [])}),
+                "n_uncertainty": len(r.get("uncertainty_flags", [])),
                 "regime_risk_on": bool(regime and regime.get("risk_on")),
                 "volume_confirmed": bool(r["sub_scores"].get("volume", 0) >= 3.0),
                 "sr_clean": bool(r["sub_scores"].get("support_resistance", 0) >= 4.0),
@@ -190,6 +222,36 @@ def report(entries: list[dict]) -> None:
     _bucket(entries, lambda e: e["elliott_support"], "Elliott supportive")
     _bucket(entries, lambda e: e["elliott_conflict"], "Elliott conflicting")
     _bucket(entries, lambda e: e["region"], "region")
+    # ── v3.5: per-conflict-TYPE effect (the 2-vs-3+ inversion resolver) ─────
+    all_types = sorted({t for e in entries for t in e.get("conflict_types", [])})
+    print(f"\n== per-conflict-type effect (WITH vs WITHOUT, n={len(entries)}) ==")
+    print(f"{'type':26} {'nW':>4} {'hitW%':>6} {'nWo':>4} {'hitWo%':>6} {'delta':>6}")
+    for t in all_types:
+        w = [e for e in entries if t in e.get("conflict_types", [])]
+        wo = [e for e in entries if t not in e.get("conflict_types", [])]
+
+        def _hit(g):
+            wn = sum(1 for e in g if e["outcome"] == "WIN")
+            dc = sum(1 for e in g if e["outcome"] in ("WIN", "LOSS", "AMBIGUOUS"))
+            return (100 * wn / dc if dc else None), dc
+        hw, dw = _hit(w)
+        hwo, dwo = _hit(wo)
+        if hw is None or hwo is None:
+            continue
+        print(f"{t:26} {dw:>4} {hw:>6.1f} {dwo:>4} {hwo:>6.1f} {hw - hwo:>+6.1f}")
+
+    # composition of the EXACTLY-2-conflict bucket (the inverted one)
+    from collections import Counter
+    two = [e for e in entries if e["n_conflicts"] == 2]
+    combo = Counter(tuple(e.get("conflict_types", [])) for e in two)
+    print(f"\n== exactly-2-conflict compositions (n={len(two)}) ==")
+    for types_, cnt in combo.most_common(8):
+        g = [e for e in two if tuple(e.get("conflict_types", [])) == types_]
+        wn = sum(1 for e in g if e["outcome"] == "WIN")
+        dc = sum(1 for e in g if e["outcome"] in ("WIN", "LOSS", "AMBIGUOUS"))
+        hr = f"{100 * wn / dc:5.1f}%" if dc else "  n/a"
+        print(f"  {cnt:>3}x {hr}  {'+'.join(types_)}")
+
     wins = [e for e in entries if e["outcome"] == "WIN" and e["bars_to_resolve"]]
     if wins:
         ratios = sorted(e["bars_to_resolve"] / max(1, e["expected_days"]) for e in wins)

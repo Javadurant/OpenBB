@@ -118,6 +118,37 @@ def import_items(items: list[dict], store: str = STORE) -> dict:
             "store": store}
 
 
+def load_avanza_news(symbol: str, store: str = STORE,
+                     max_items: int = 6) -> list[dict]:
+    """Scanner-consumption hook: fresh imported Avanza/Placera items for one
+    symbol in the scanner's news_context item shape. Age is RECOMPUTED from
+    article_time at read time (an item imported fresh goes stale honestly)."""
+    if not os.path.exists(store):
+        return []
+    from api.setup_scanner import NEWS_STALE_DAYS
+    today = datetime.now(timezone.utc).date()
+    out: list[dict] = []
+    with open(store, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("symbol") != symbol:
+                continue
+            try:
+                art = datetime.fromisoformat(str(rec["article_time"]).replace("Z", "+00:00"))
+                age = max(0, (today - art.date()).days)
+            except (KeyError, ValueError):
+                continue
+            if age > NEWS_STALE_DAYS:
+                continue
+            out.append({"title": rec.get("headline", ""),
+                        "summary": rec.get("summary", ""),
+                        "age_days": age})
+    return out[-max_items:]
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--template")

@@ -74,6 +74,60 @@ def parse_fmp_items(raw: list, now: Optional[datetime] = None) -> list[dict]:
     return items[:_FMP_MAX_ITEMS]
 
 
+_CAPS_CACHE: dict = {}
+
+
+def fmp_capabilities(force: bool = False) -> dict:
+    """Probe which FMP endpoints the current plan allows (booleans + HTTP
+    reason only - the key value NEVER appears in output). One tiny request per
+    endpoint, cached per process so /api/ready doesn't spam FMP.
+
+    Verified 2026-07-11: news is plan-gated (stable→402, v3→403) on this key.
+    If the plan is upgraded later, this reports available=True with ZERO code
+    changes - fetch_fmp_news starts returning items automatically."""
+    global _CAPS_CACHE
+    if _CAPS_CACHE and not force:
+        return _CAPS_CACHE
+    key = os.getenv("FMP_API_KEY", "").strip()
+    caps: dict = {"fmp_key_present": bool(key),
+                  "fmp_news_available": False,
+                  "fmp_profile_available": False,
+                  "fmp_calendar_available": False,
+                  "fmp_plan_gate_reason": None}
+    if not key:
+        caps["fmp_plan_gate_reason"] = "FMP_API_KEY not set"
+        _CAPS_CACHE = caps
+        return caps
+
+    def _probe(url_no_key: str) -> tuple[bool, Optional[str]]:
+        sep = "&" if "?" in url_no_key else "?"
+        try:
+            req = urllib.request.Request(f"{url_no_key}{sep}apikey={key}",
+                                         headers={"User-Agent": "sentriq-scanner"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return bool(data), None
+        except urllib.error.HTTPError as e:  # never echoes the URL (contains key)
+            return False, f"HTTP {e.code}"
+        except Exception as exc:  # noqa: BLE001
+            return False, type(exc).__name__
+
+    news_ok, news_err = _probe(
+        "https://financialmodelingprep.com/api/v3/stock_news?tickers=AAPL&limit=1")
+    prof_ok, prof_err = _probe(
+        "https://financialmodelingprep.com/api/v3/profile/AAPL")
+    cal_ok, cal_err = _probe(
+        "https://financialmodelingprep.com/api/v3/earning_calendar?from=2026-07-10&to=2026-07-12")
+    caps.update(fmp_news_available=news_ok, fmp_profile_available=prof_ok,
+                fmp_calendar_available=cal_ok)
+    if not news_ok:
+        caps["fmp_plan_gate_reason"] = f"news endpoint: {news_err or 'empty'}" + \
+            (f"; profile: {prof_err}" if not prof_ok and prof_err else "") + \
+            (f"; calendar: {cal_err}" if not cal_ok and cal_err else "")
+    _CAPS_CACHE = caps
+    return caps
+
+
 def fetch_fmp_news(symbol: str, limit: int = _FMP_MAX_ITEMS) -> Optional[dict]:
     """Fetch news for one symbol. Returns the scanner news_context dict or
     None (missing key, non-US coverage gap, network failure, bad payload).

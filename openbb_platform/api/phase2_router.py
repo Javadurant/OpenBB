@@ -621,8 +621,26 @@ def _intraday_refine_top(top: dict) -> None:
     Finalists only - never per-candidate. Mutates top['intraday'] in place."""
     sym = top.get("symbol")
     try:
-        import yfinance as yf
         from .setup_scanner import refine_target_time_intraday
+        dist = float(top["target"]) - float(top["entry"])
+        tz0 = "Europe/Stockholm" if str(sym).upper().endswith(".ST") else \
+            "exchange local" if top.get("asset_class") != "crypto" else "UTC (24/7)"
+        # v3.5: USER-IMPORTED intraday export (sub-60m capable) takes precedence
+        # over the yfinance 60m fallback (see api/tools/import_intraday.py).
+        try:
+            from .tools.import_intraday import load_intraday_reference
+            ref = load_intraday_reference(sym)
+        except Exception:  # noqa: BLE001
+            ref = None
+        if ref is not None:
+            ih, il, ic, per_day = ref
+            res = refine_target_time_intraday(
+                top.get("base_case_target_date", ""), dist, ih, il, ic, per_day, tz0)
+            res["intraday_source"] = "user-imported intraday export (intraday_reference/)"
+            top["intraday"] = res
+            if res.get("intraday_available"):
+                return
+        import yfinance as yf
         h = yf.Ticker(sym).history(period="60d", interval="60m")
         if h is None or len(h) < 30:
             top["intraday"] = {"intraday_available": False, "intraday_source": "yfinance 60m",
@@ -703,20 +721,45 @@ def _candidate_news(sym: str, asset_class: str, as_of: str) -> Optional[dict]:
     yfinance source works for .ST symbols too, unlike FMP's thin Nordic feed)."""
     if asset_class not in ("equity", "etf"):
         return None
-    # v3.4: FMP first when the server env has a key (verified US coverage;
-    # .ST returns empty on FMP), yfinance fallback covers Nordic names.
+    items: list[dict] = []
+    sources: list[str] = []
+    # v3.5: manually imported Avanza/Placera items FIRST (only real Swedish
+    # coverage available; FMP has no .ST news, Bigdata is paused).
+    try:
+        from .tools.import_avanza_placera_news import load_avanza_news
+        av = load_avanza_news(sym)
+        if av:
+            items.extend(av)
+            sources.append("Avanza/Placera manual-copy")
+    except Exception:  # noqa: BLE001 - optional source
+        pass
+    # v3.4: FMP when the plan allows (verified plan-gated 402/403 on 2026-07-11;
+    # degrades to None), then yfinance fallback.
     try:
         from .fmp_news import fetch_fmp_news
         fmp = fetch_fmp_news(sym)
         if fmp is not None:
-            return fmp
+            items.extend(fmp["items"])
+            sources.append("FMP stock_news")
     except Exception:  # noqa: BLE001 - adapter is optional
         pass
-    nc = _news_context(sym)
-    if not nc or not nc.get("headlines"):
+    if not items:
+        nc = _news_context(sym)
+        if nc and nc.get("headlines"):
+            items.extend(nc["headlines"])
+            sources.append("yfinance news")
+    if not items:
         return None
-    return {"items": nc["headlines"],
-            "source": "yfinance news + lexicon sentiment (model-derived)",
+    # dedup across sources on normalized title
+    seen: set = set()
+    unique = []
+    for it in items:
+        k = (it.get("title") or "").strip().lower()
+        if k and k not in seen:
+            seen.add(k)
+            unique.append(it)
+    return {"items": unique,
+            "source": " + ".join(sources) + " (lexicon sentiment, model-derived)",
             "as_of": as_of}
 
 
