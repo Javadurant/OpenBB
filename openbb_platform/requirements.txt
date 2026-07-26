@@ -1,24 +1,55 @@
-# --- Core Platform ---
-openbb>=4.1.0
-openbb-yfinance>=4.1.0
-pandas>=2.0.0
-numpy>=1.24.0
-scipy>=1.10.0
+# ============================================================
+# OpenBB Platform + Sentriq Minimal Requirements
+# Python 3.11 compatible (Let pip resolve dependencies)
+# ============================================================
 
-# --- UI & Charting ---
-streamlit>=1.30.0
-streamlit-searchbox>=0.1.0
-streamlit-lightweight-charts>=0.1.3
-pytickersymbols>=1.17.0
-plotly>=5.18.0
+# --- Core ---
+openbb-core
+openbb-platform-api
 
-# --- Data Providers & Fallbacks ---
-yfinance>=0.2.35
-tfinance>=0.1.0
-tsetmc>=0.4.5
-requests>=2.31.0
+# --- Data Providers ---
+openbb-fred
+openbb-yfinance
+openbb-bls
+openbb-sec
+openbb-tiingo
 
-# --- Technical Analysis & Models ---
-pandas-ta>=0.3.14b
-scikit-learn>=1.3.0
-pyharmonics>=0.1.0
+# --- Asset Classes ---
+openbb-equity
+openbb-economy
+
+# --- UI ---
+streamlit
+plotly
+
+# --- Core Scientific ---
+pandas
+numpy
+scipy
+scikit-learn
+
+# --- API ---
+fastapi
+uvicorn
+pydantic
+
+# --- Data ---
+yfinance
+requests
+
+# --- AI ---
+openai
+anthropic
+
+# --- AI/ML ---
+groq
+
+# --- Utilities ---
+python-dotenv
+python-dateutil
+pytz
+# --- Dev / Test ---
+pytest>=9.0
+pytest-asyncio>=1.0
+sentry-sdk[fastapi]>=2.0
+pytest-cov>=7.0
