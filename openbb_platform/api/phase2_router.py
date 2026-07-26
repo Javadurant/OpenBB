@@ -408,6 +408,37 @@ SETUP_UNIVERSE: list[tuple[str, str, str]] = (
     [(s, "International", "silver") for s in ("SLV","SI=F")]
 )
 
+# ── Universe coverage provenance (honest labelling) ─────────────────────
+# SENTRIQ product rule: Setup of the Day must NEVER imply it scanned the
+# whole market when it did not. SETUP_UNIVERSE above is a CURATED WATCHLIST,
+# not a provider-discovered exchange/market universe. We label that truthfully
+# with the project coverage taxonomy so the API (and UI) can state exactly how
+# a winner was selected — "best of this curated list", never "best in market".
+#   full_provider_market | full_exchange_market | broad_index_universe |
+#   broad_provider_universe | curated_fallback | small_watchlist_fallback |
+#   data_limited | provider_blocked | key_missing | plan_gated
+UNIVERSE_SOURCE = "curated_watchlist"
+
+def _coverage_label_for(discovered: int) -> str:
+    """Honest coverage label from how many symbols a bucket draws from.
+    These lists are hand-curated, so the ceiling is 'curated', never
+    'full_*_market' — that claim requires provider-list verification."""
+    if discovered == 0:
+        return "data_limited"
+    if discovered <= 15:
+        return "small_watchlist_fallback"
+    return "curated_fallback"
+
+def _universe_counts() -> dict[str, dict[str, int]]:
+    """Count SETUP_UNIVERSE symbols per (region, asset_class) — the honest
+    'discovered' denominator, derived from the live universe so it can never
+    drift out of sync with what is actually scanned."""
+    counts: dict[str, dict[str, int]] = {}
+    for _sym, _region, _ac in SETUP_UNIVERSE:
+        counts.setdefault(_region, {}).setdefault(_ac, 0)
+        counts[_region][_ac] += 1
+    return counts
+
 # v3: honest proxy labelling for indirect commodity/crypto exposure.
 # A proxy is NEVER mislabelled as the direct commodity; the UI shows the note.
 _PROXY_META: dict[str, str] = {
@@ -456,11 +487,18 @@ def _market_regime_map() -> dict[str, Optional[dict]]:
     DOWNGRADED (conflict + A-grade cap), never hidden. Best effort per index."""
     out: dict[str, Optional[dict]] = {}
     try:
+        import math
         import yfinance as yf
         for region, idx in (("Swedish", "^OMX"), ("International", "^GSPC")):
             try:
                 h = yf.Ticker(idx).history(period="2y")
-                c = [float(x) for x in h["Close"]]
+                # v3.9.3: drop NaN/inf Close bars before the MA. yfinance routinely
+                # returns a NaN for the latest/partial index bar; left unfiltered it
+                # makes sum()/c[-1] NaN, and `nan > nan` silently yields
+                # risk_on=False - flipping a genuinely risk-on tape (e.g. ^GSPC
+                # 7408 > MA200 7002) to risk-off and penalising every bullish setup.
+                # Filter first so a transient trailing null bar is simply ignored.
+                c = [v for v in (float(x) for x in h["Close"]) if math.isfinite(v)]
                 if len(c) < 200:
                     out[region] = None
                     continue
@@ -716,9 +754,12 @@ def _fetch_event_context(sym: str, asset_class: str) -> Optional[dict]:
         return None
 
 
-def _candidate_news(sym: str, asset_class: str, as_of: str) -> Optional[dict]:
-    """News items for scanner-side lexicon sentiment (equities/ETFs only;
-    yfinance source works for .ST symbols too, unlike FMP's thin Nordic feed)."""
+def _candidate_news(sym: str, asset_class: str, as_of: str,
+                    name: Optional[str] = None) -> Optional[dict]:
+    """News items for scanner-side sentiment (equities/ETFs only;
+    yfinance source works for .ST symbols too, unlike FMP's thin Nordic feed).
+    v3.7: tvremix wire news (.ST coverage incl. Dow Jones) + Bigdata.com
+    licensed chunk sentiment join the chain; `name` improves Bigdata matching."""
     if asset_class not in ("equity", "etf"):
         return None
     items: list[dict] = []
@@ -733,6 +774,17 @@ def _candidate_news(sym: str, asset_class: str, as_of: str) -> Optional[dict]:
             sources.append("Avanza/Placera manual-copy")
     except Exception:  # noqa: BLE001 - optional source
         pass
+    # v3.7: TradingView wire news via tvremix (live-verified 2026-07-22:
+    # same-day Dow Jones Newswires for OMXSTO:VOLV_B). Deterministic .ST
+    # mapping only; unmappable symbols degrade to None honestly.
+    try:
+        from .tvremix_client import fetch_tvremix_news
+        tvn = fetch_tvremix_news(sym)
+        if tvn is not None:
+            items.extend(tvn["items"])
+            sources.append(tvn["source"])
+    except Exception:  # noqa: BLE001 - adapter is optional
+        pass
     # v3.6: Polygon news with LICENSED per-ticker sentiment (live-verified
     # 2026-07-12; US coverage - .ST degrades to None honestly).
     try:
@@ -741,6 +793,20 @@ def _candidate_news(sym: str, asset_class: str, as_of: str) -> Optional[dict]:
         if poly is not None:
             items.extend(poly["items"])
             sources.append(poly["source"])
+    except Exception:  # noqa: BLE001 - adapter is optional
+        pass
+    # v3.7: Bigdata.com search with LICENSED chunk sentiment (live-verified
+    # 2026-07-22: premium MT Newswires + numeric sentiment; subscription
+    # re-activated). Capability-gated so a paused subscription costs zero
+    # per-candidate HTTP calls; company NAME queries match best.
+    try:
+        from .bigdata_client import bigdata_capabilities, fetch_bigdata_news
+        if bigdata_capabilities().get("bigdata_working"):
+            bq = name if (name and name != sym) else sym.split(".")[0].replace("-", " ")
+            bd = fetch_bigdata_news(bq)
+            if bd is not None:
+                items.extend(bd["items"])
+                sources.append(bd["source"])
     except Exception:  # noqa: BLE001 - adapter is optional
         pass
     # v3.4: FMP when the plan allows (2026-07-12 re-probe: HTTP 401 - the .env
@@ -768,15 +834,29 @@ def _candidate_news(sym: str, asset_class: str, as_of: str) -> Optional[dict]:
         if k and k not in seen:
             seen.add(k)
             unique.append(it)
+    # v3.7 honesty fix: only claim "lexicon/model-derived" when NO item carries
+    # a licensed per-item sentiment label (Polygon insights / Bigdata chunks).
+    # When licensed items are present the aggregate is genuinely mixed — say so,
+    # so the source string matches the method news_sentiment() actually reports.
+    has_licensed = any(it.get("sentiment") for it in unique)
+    suffix = (" (mixed licensed + lexicon sentiment)" if has_licensed
+              else " (lexicon sentiment, model-derived)")
     return {"items": unique,
-            "source": " + ".join(sources) + " (lexicon sentiment, model-derived)",
+            "source": " + ".join(sources) + suffix,
             "as_of": as_of}
 
 
 def _fetch_and_score(entry: tuple[str, str, str],
                      calibration: Optional[dict] = None,
-                     regime_map: Optional[dict] = None) -> Optional[dict]:
-    """Fetch 1y daily history for one (symbol, region, asset_class) and score it."""
+                     regime_map: Optional[dict] = None,
+                     news_enabled: bool = True) -> Optional[dict]:
+    """Fetch 1y daily history for one (symbol, region, asset_class) and score it.
+
+    news_enabled=False skips the per-candidate news chain (tvremix/Polygon/
+    Bigdata/yfinance) — used by the broad market scan where scoring hundreds of
+    symbols must not hammer the rate-limited news APIs. The news sub-score is
+    supports-only and optional (excluded from the denominator when absent), so
+    the grade reflects technical structure; news is fetched for finalists."""
     import asyncio
     from .data_ingestion import service as _ingest, DataMissingException  # <- NEW [Phase3-Step1]: ingestion backbone
     sym, region, asset_class = entry
@@ -836,7 +916,10 @@ def _fetch_and_score(entry: tuple[str, str, str],
             market_regime=(regime_map or {}).get(region),   # v3.2: index regime gate
             fundamentals=fundamentals,           # v3.2: fundamentals sub-score
             # v3.3: news sentiment (lexicon), sector RS, FX context
-            news_context=_candidate_news(sym, asset_class, series.as_of.date().isoformat()),
+            news_context=(_candidate_news(sym, asset_class,
+                                          series.as_of.date().isoformat(),
+                                          name=name)  # v3.7: name → Bigdata matching
+                          if news_enabled else None),  # v3.8: skip in broad scan
             sector_context=_sector_context_for(sector, closes),
             fx_context=_fx_context_for(sym, region),
         )
@@ -898,6 +981,113 @@ def setup_of_the_day(refresh: bool = False):
         return _structured_error("SETUP_SCAN_FAILED", exc, "setup_scanner", rid)
 
 
+_CONFLICTED_TTL_SEC = 1800.0  # match the setup-of-the-day 30-min cadence
+
+
+@router.get("/api/discover/conflicted-scan")
+def conflicted_scan(refresh: bool = False, limit: int = 50):
+    """Conflicted Buy Setup market scanner (v3.7): market-wide discovery via
+    the TradingView screener (sweden/america/crypto) with Bigdata licensed
+    sentiment overlay. Conviction = TV Recommend.All linearly mapped to
+    0-100 (user decision 2026-07-22). Unfiltered universe, honestly labelled.
+    Internal signal generation only — see redistribution_note (TRUTH 3)."""
+    import uuid as _uuid
+    rid = _uuid.uuid4().hex[:12]
+    try:
+        # Shared _CACHE from omnisearch_router — single cache layer, no forks.
+        from .omnisearch_router import _cache_get, _cache_set
+        from .tvremix_scanner import conflicted_buy_scan
+        limit = max(1, min(int(limit), 200))
+        cache_key = f"conflicted_scan:v3.7:{limit}"
+        if not refresh:
+            cached = _cache_get(cache_key, ttl=_CONFLICTED_TTL_SEC)
+            if cached is not None:
+                out = dict(cached)
+                out["cached"] = True
+                return out
+        result = conflicted_buy_scan(limit=limit)
+        result["cached"] = False
+        _cache_set(cache_key, result)
+        return result
+    except Exception as exc:  # noqa: BLE001 - contract: never crash unstructured
+        logger.exception("conflicted-scan failed [request_id=%s]", rid)
+        return _structured_error("CONFLICTED_SCAN_FAILED", exc, "tvremix_scanner", rid)
+
+
+_BROAD_TTL_SEC = 3600.0  # broad scan is expensive — cache 1h
+
+
+@router.get("/api/discover/broad-scan")
+def broad_scan_endpoint(region: str = "Swedish", depth: int = 200, refresh: bool = False):
+    """Broad market scan (v3.8) — grades the top-`depth` most-liquid names of the
+    FULL discovered exchange universe (946 ST / 18k US), not the ~12-name curated
+    watchlist. Liquidity comes from ONE tvremix screener call (no per-symbol
+    probe); grades A/B/C come from SENTRIQ's own setup_scanner. Surfaces real
+    Grade A (HIGHEST CONVICTION) / Grade B (SOLID ALIGNMENT). Cached 1h."""
+    import uuid as _uuid
+    rid = _uuid.uuid4().hex[:12]
+    try:
+        from .omnisearch_router import _cache_get, _cache_set
+        from .broad_scan import broad_scan as _bscan
+        region = "Swedish" if str(region).lower().startswith("swed") else "International"
+        depth = max(10, min(int(depth), 250))
+        cache_key = f"broad_scan:v1:{region}:{depth}"
+        if not refresh:
+            cached = _cache_get(cache_key, ttl=_BROAD_TTL_SEC)
+            if cached is not None:
+                return {**cached, "cached": True}
+        # Reuse the SOTD scan-level context: regime gate + ledger timing calibration.
+        regime_map = _market_regime_map()
+        calibration = None
+        try:
+            from .setup_ledger import timing_calibration as _timing_calib
+            calibration = _timing_calib()
+        except Exception:  # noqa: BLE001 - calibration is an enhancement, never a blocker
+            logger.warning("broad-scan timing calibration unavailable", exc_info=True)
+        result = _bscan(region, score_fn=_fetch_and_score, regime_map=regime_map,
+                        calibration=calibration, depth=depth)
+        result["cached"] = False
+        _cache_set(cache_key, result)
+        return result
+    except Exception as exc:  # noqa: BLE001 - contract: never crash unstructured
+        logger.exception("broad-scan failed [request_id=%s]", rid)
+        return _structured_error("BROAD_SCAN_FAILED", exc, "broad_scan", rid)
+
+
+def _json_safe(obj):
+    """Recursively replace non-JSON-compliant floats (nan / +-inf) with None.
+    json.dumps rejects them, so ONE bad computed value (e.g. a 0/0 ratio on some
+    thinly-traded symbol now that EODHD opened the full 18k/945 universe) would
+    500 the WHOLE endpoint. Applied to scanner payloads before caching/return so
+    a single degenerate float can never take the section down again."""
+    if isinstance(obj, float):
+        # nan != nan; inf/-inf are outside JSON's range
+        if obj != obj or obj in (float("inf"), float("-inf")):
+            return None
+        return obj
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
+
+
+_GRADE_RANK_SOTD = {"A": 0, "B": 1, "C": 2}
+
+
+def _member_sort_key(r: dict):
+    """Setup-of-the-Day per-box selection order (v3.8):
+      1. direct instruments before proxies,
+      2. GRADE (A > B > C) — a cleaner Grade-B 'solid alignment' (≤1 conflict)
+         is preferred over a higher-SCORE but more-conflicted Grade-C, because
+         the grade encodes conflict count (the INVE-B safety fix),
+      3. higher score within a grade,
+      4. symbol, so selection is deterministic run-to-run (audit reproducibility).
+    """
+    return (bool(r.get("proxy")), _GRADE_RANK_SOTD.get(r.get("grade"), 9),
+            -(r.get("score") or 0.0), r.get("symbol", ""))
+
+
 def _setup_of_the_day_impl(refresh: bool = False) -> dict[str, Any]:
     """
     The Setup Scanner — best-qualifying setup per (region × asset class).
@@ -912,7 +1102,7 @@ def _setup_of_the_day_impl(refresh: bool = False) -> dict[str, Any]:
     Decision-support, not advice. Every level computed from live OHLCV;
     target is an ATR time WINDOW, never a hard date. v1 = "as of last close".
     """
-    cache_key = "setup_v3.2"
+    cache_key = "setup_v3.9"  # v3.9: bullish-structure scoring (harmonic/Elliott raise conviction)
     now = _time.time()
     if (not refresh and _SETUP_CACHE["data"] is not None
             and _SETUP_CACHE["key"] == cache_key
@@ -933,11 +1123,37 @@ def _setup_of_the_day_impl(refresh: bool = False) -> dict[str, Any]:
     # v3.2: scan-level market-regime gate (OMXS30 / S&P 500 vs 200-day MA).
     regime_map = _market_regime_map()
 
-    # Parallel fetch+score across the whole tagged universe.
+    # v3.8: EQUITY boxes now rank the BROAD liquid universe (not the ~12-name
+    # watchlist) — the fix for "best of 12" vs "best in market". ONE bulk tvremix
+    # screener call per region supplies liquidity (NO 946-symbol probe); the
+    # discovered exchange universe is turnover-ranked and the top tranche is
+    # graded by the SAME setup_scanner. Equity is scored news-DISABLED for
+    # breadth speed (news is small/supports-only and re-attached to the winner
+    # in the finalist block); non-equity keeps the curated news path. Degrades to
+    # curated-only if the broad universe is unavailable — never blocks the scan.
+    _SOTD_BROAD_DEPTH = 200  # per region; the real Grade-A/B often live in the liquid tail
+    scan_entries: list[tuple[str, str, str]] = list(SETUP_UNIVERSE)
+    equity_universe_meta: dict[str, dict] = {}
+    try:
+        from .broad_scan import broad_equity_entries as _broad_eq
+        _seen_eq = {(s, r) for (s, r, a) in scan_entries if a == "equity"}
+        for _reg in ("Swedish", "International"):
+            _ents, _meta = _broad_eq(_reg, depth=_SOTD_BROAD_DEPTH)
+            equity_universe_meta[_reg] = _meta
+            for _e in _ents:
+                if (_e[0], _e[1]) not in _seen_eq:
+                    scan_entries.append(_e)
+                    _seen_eq.add((_e[0], _e[1]))
+    except Exception:  # noqa: BLE001 - broad universe is an enhancement, never a blocker
+        logger.warning("SOTD broad equity universe unavailable; equity = curated only",
+                       exc_info=True)
+
+    # Parallel fetch+score. Equity → news DISABLED (breadth); other classes → news on.
     scored: list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        futs = {pool.submit(_fetch_and_score, e, calibration, regime_map): e
-                for e in SETUP_UNIVERSE}
+        futs = {pool.submit(_fetch_and_score, e, calibration, regime_map,
+                            e[2] != "equity"): e
+                for e in scan_entries}
         for fut in as_completed(futs):
             r = fut.result()
             if r is not None:
@@ -946,16 +1162,13 @@ def _setup_of_the_day_impl(refresh: bool = False) -> dict[str, Any]:
     # Group into boxes[region][asset_class] → best by (direct-before-proxy, score).
     classes = ("equity", "etf", "fund", "crypto",
                "gold", "oil", "copper", "silver")   # v3: + gold/oil; v3.1: + copper/silver
+    universe_counts = _universe_counts()   # honest 'discovered' denominator per bucket
     boxes: dict[str, Any] = {}
     for region in ("Swedish", "International"):
         boxes[region] = {}
         for ac in classes:
             members = [s for s in scored if s.get("region") == region and s.get("asset_class") == ac]
-            # Direct Swedish-listed instruments beat proxies at selection time;
-            # within each tier, highest score wins; symbol breaks exact ties so
-            # selection is deterministic run-to-run (audit: reproducibility).
-            members.sort(key=lambda r: (bool(r.get("proxy")), -r.get("score", 0),
-                                        r.get("symbol", "")))
+            members.sort(key=_member_sort_key)  # v3.8: grade-first (see helper docstring)
             top = members[0] if members else None
             has_quality = bool(top and top.get("grade") in ("A", "B"))
             if not members:
@@ -981,7 +1194,7 @@ def _setup_of_the_day_impl(refresh: bool = False) -> dict[str, Any]:
                     + ")"),
                 "biggest_strength": m.get("strongest_supporting"),
                 "biggest_weakness": m.get("strongest_opposing"),
-            } for i, m in enumerate(members)]
+            } for i, m in enumerate(members[:15])]  # v3.8: cap display list (equity pool is now broad)
             # v3.3: finalist refinement (SELECTED setup only - rate-limit safe):
             # intraday target-time, real bid/ask spread, FX-adjusted display.
             if top is not None:
@@ -1000,11 +1213,75 @@ def _setup_of_the_day_impl(refresh: bool = False) -> dict[str, Any]:
                     fxc["fx_adjusted_target_sek"] = round(top["target"] * fxc["rate"], 2)
                     fxc["fx_adjusted_invalidation_sek"] = round(
                         (top.get("invalidation") or 0) * fxc["rate"], 2)
+                # v3.7: TradingView 1D rating for the SELECTED setup only.
+                # INFORMATIONAL ONLY (user decision 2026-07-22): never enters
+                # the score, grade, conflicts count or classification. Raw TV
+                # quote fields are deliberately NOT surfaced (TRUTH 3 gate).
+                try:
+                    from .tvremix_client import get_technicals_rating, to_tv_symbol
+                    _tvs = to_tv_symbol(top["symbol"])
+                    _tvr = get_technicals_rating(_tvs) if _tvs else None
+                    _summ = (_tvr or {}).get("summary") or {}
+                    if _summ.get("recommendation"):
+                        _rec = str(_summ["recommendation"])
+                        top["tv_rating"] = {
+                            "recommendation": _rec,
+                            "value": _summ.get("value"),
+                            "interval": "1D",
+                            "source": "TradingView via tvremix",
+                            "in_score": False,
+                            "note": ("informational only — not part of the setup "
+                                     "score (user decision 2026-07-22)"),
+                        }
+                        if _rec in ("Buy", "Strong Buy"):
+                            top.setdefault("supports", []).append(
+                                f"TradingView 1D rating: {_rec} (informational, not scored)")
+                        elif _rec in ("Sell", "Strong Sell"):
+                            top.setdefault("uncertainty_flags", []).append(
+                                f"TradingView 1D rating {_rec} disagrees "
+                                "(informational, not scored)")
+                except Exception:  # noqa: BLE001 - enrichment never breaks the scan
+                    pass
+                # v3.8: equity winners are graded news-DISABLED (breadth). Attach
+                # news to the SELECTED equity setup for DISPLAY only — score/max
+                # are None so it is never folded into the scored denominator; the
+                # grade already stands. Keeps the news-provenance chip working.
+                if top.get("asset_class") == "equity" and not top.get("news"):
+                    try:
+                        _nc = _candidate_news(top["symbol"], "equity",
+                                              top.get("as_of") or "", name=top.get("name"))
+                        if _nc and _nc.get("items"):
+                            from .setup_scanner import news_sentiment as _news_senti
+                            top["news"] = {
+                                "score": None, "max": None,
+                                "sentiment": _news_senti(_nc["items"]),
+                                "source": _nc["source"], "as_of": _nc["as_of"],
+                                "top_items": _nc["items"][:4],
+                            }
+                    except Exception:  # noqa: BLE001 - display enrichment never breaks the scan
+                        pass
+            _discovered = universe_counts.get(region, {}).get(ac, 0)
+            _usrc = UNIVERSE_SOURCE          # honest: curated watchlist, not full market
+            _cov = _coverage_label_for(_discovered)
+            # v3.8: equity boxes now rank the broad liquid universe — label them so,
+            # never as "curated". Non-equity boxes keep the curated labelling.
+            if ac == "equity" and region in equity_universe_meta:
+                _m = equity_universe_meta[region]
+                _discovered = _m.get("discovered") or _discovered
+                _usrc = "broad_liquid_universe"
+                _cov = (f"top {_m.get('shortlisted', 0)} most-liquid of "
+                        f"{_m.get('discovered', 0)} discovered {_m.get('exchange', '')} "
+                        f"equities · liquidity via TradingView screener, grade via "
+                        f"setup_scanner ({_m.get('discovery_label', '')})")
             boxes[region][ac] = {
                 "top_setup":   top,
                 "has_quality": has_quality,
                 "message":     msg,
-                "scanned":     len(members),
+                "scanned":     len(members),          # symbols that returned usable data
+                "discovered":  _discovered,           # equity: broad universe; else curated bucket
+                "excluded":    max(_discovered - len(members), 0),  # dropped: no/insufficient/stale data
+                "universe_source": _usrc,
+                "coverage_label":  _cov,
                 "candidates":  candidates,
             }
 
@@ -1021,16 +1298,159 @@ def _setup_of_the_day_impl(refresh: bool = False) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         logger.warning("ledger logging skipped", exc_info=True)
 
+    # v3.6: cross-reference each equity box against the FULL provider exchange
+    # list (EODHD), so the UI can state "N of M" honestly — a curated subset of
+    # a full_exchange_market universe, never "the whole market". Cached daily;
+    # any discovery failure degrades to a labelled note and never breaks the scan.
+    try:
+        from .universe_registry import discover_exchange as _disc, EXCHANGE_META as _EXM
+        for _region, _exch in (("Swedish", "ST"), ("International", "US")):
+            _u = _disc(_exch)
+            _eq = boxes.get(_region, {}).get("equity")
+            if _eq is None:
+                continue
+            _disc_n = _u.get("discovered")
+            _eq_disc = sum(1 for s in _u.get("symbols", []) if s.get("asset_class") == "equity")
+            _eq["exchange_universe"] = {
+                "exchange": _exch,
+                "exchange_name": _EXM.get(_exch, {}).get("name"),
+                "provider": _u.get("source_provider"),
+                "discovery_coverage_label": _u.get("coverage_label"),
+                "exchange_equities": _eq_disc or None,
+                "scanned_of_exchange": (
+                    f"{_eq.get('scanned')} of {_eq_disc} {_EXM.get(_exch, {}).get('name')} "
+                    "equities scanned (v3.8: top liquid tranche of the full exchange, "
+                    "grade-ranked by setup_scanner)"
+                    if _eq_disc else None),
+            }
+    except Exception:  # noqa: BLE001 - cross-reference is an enhancement, never a blocker
+        logger.warning("exchange cross-reference skipped", exc_info=True)
+
+    # v3.9.2: Structure Watch — aggregate EVERY scanned setup carrying a bearish
+    # harmonic (completed/near-miss) or a COMPLETED Elliott buy, so the UI renders a
+    # dedicated, scannable sub-section for manual buy-signal validation. Read-only;
+    # separate from the scored boxes (weight stays 8, no scoring change).
+    # v3.9.3: recency contract. The authoritative age gate lives in
+    # setup_scanner._structure_flags (MAX_STRUCTURE_AGE_BARS), which nulls a stale
+    # harmonic PRZ / Elliott completion at source. This is a defensive SECONDARY
+    # filter so a month-old pattern (the Mycronic AB case, Point D ~22 bars back)
+    # can never reach the payload even if a flag is ever produced without the source
+    # gate. Fail-open on a missing age so a plumbing gap never empties the section.
+    from .setup_scanner import MAX_STRUCTURE_AGE_BARS as _MAX_SW_AGE
+
+    def _fresh(flag: Optional[dict]) -> bool:
+        if not flag:
+            return True
+        a = flag.get("age_bars")
+        return a is None or a <= _MAX_SW_AGE
+
+    _structure_watch: list[dict] = []
+    for r in scored:
+        sf = r.get("structure_flags") or {}
+        bh = sf.get("bearish_harmonic")
+        eb = sf.get("elliott_buy")
+        eb = eb if (eb and eb.get("completed")) else None
+        bh = bh if _fresh(bh) else None
+        eb = eb if _fresh(eb) else None
+        if bh or eb:
+            _structure_watch.append({
+                "symbol": r.get("symbol"), "name": r.get("name"),
+                "region": r.get("region"), "asset_class": r.get("asset_class"),
+                "grade": r.get("grade"), "score": r.get("score"),
+                "classification": r.get("classification"),
+                "last_price": r.get("last_price"),
+                "bearish_harmonic": bh, "elliott_buy": eb,
+            })
+    # bearish-harmonic (buy-validity risk) first, then completed Elliott buys; by score.
+    _structure_watch.sort(key=lambda w: (0 if w["bearish_harmonic"] else 1,
+                                         -(w.get("score") or 0.0), w.get("symbol") or ""))
+    _structure_watch = _structure_watch[:80]   # bound payload
+
     result = {
         "status":      "ok",
         "as_of":       "latest close (crypto: 24/7)",
         "cached":      False,
         "market_regime": regime_map,   # v3.2: scan-level index regime
         "boxes":       boxes,
+        "structure_watch": _structure_watch,   # v3.9.2: scannable bearish-harmonic + Elliott-buy flags
+        "structure_watch_counts": {
+            "bearish_harmonic": sum(1 for w in _structure_watch if w["bearish_harmonic"]),
+            "elliott_buy": sum(1 for w in _structure_watch if w["elliott_buy"]),
+        },
+        "structure_watch_max_age_bars": _MAX_SW_AGE,   # v3.9.3: recency window (trading bars)
         "total_scored": len(scored),
+        # ── Honest universe coverage (v3.8: equity is now broad) ──
+        "universe_source": "broad_liquid_equity + curated_multi_asset",
+        "universe_total":  len(scan_entries),        # instruments actually in this scan pool
+        "coverage_note": (
+            "v3.8: Setup of the Day EQUITY boxes rank the BROAD liquid universe "
+            "(top-N most-liquid of the full discovered exchange, graded by the "
+            "SAME setup_scanner) — the equity winner is the best liquid equity in "
+            "the market, not best-of-12. Selection is grade-first (a Grade-B "
+            "'solid alignment' beats a higher-score but more-conflicted Grade-C). "
+            "ETF / fund / crypto / commodity boxes remain a curated watchlist "
+            "until their provider discovery is wired."
+        ),
     }
+    # v3.8 robustness: a total data-provider outage (e.g. yfinance throttled by a
+    # heavy broad scan) can score ~nothing. NEVER overwrite a good cached scan
+    # with an empty one, and never blank the section — keep serving the last good
+    # scan, flagged stale, so a transient provider blip is invisible to the user.
+    if len(scored) == 0 and _SETUP_CACHE.get("data") is not None:
+        stale = dict(_SETUP_CACHE["data"])
+        stale["cached"] = True
+        stale["stale"] = True
+        stale["stale_reason"] = ("live scan scored 0 (data provider "
+                                 "throttled/unavailable) — serving last good scan")
+        return stale
+    result = _json_safe(result)   # v3.9.1: nan/inf → None so a bad float can't 500 the endpoint
     _SETUP_CACHE.update(key=cache_key, at=now, data=result)
     return result
+
+
+@router.get("/api/discover/universe-coverage")
+def universe_coverage(refresh: bool = False):
+    """Honest provider-universe discovery report.
+
+    Proves SENTRIQ actively discovers the BROAD provider-covered market and
+    labels coverage truthfully. For each wired exchange it shows how many
+    instruments EODHD lists (full_exchange_market) by asset class, versus the
+    curated watchlist the scanner currently ranks. Rate-safe: EODHD lists are
+    cached daily (pass ?refresh=true to force). No secrets are exposed.
+    """
+    try:
+        from .universe_registry import discover_exchange, EXCHANGE_META
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "error": f"registry unavailable: {type(exc).__name__}"}
+    curated = _universe_counts()
+    region_of = {"ST": "Swedish", "US": "International"}
+    exchanges: dict[str, Any] = {}
+    for exch in ("ST", "US"):
+        u = discover_exchange(exch, force=refresh)
+        by_class: dict[str, int] = {}
+        for s in u.get("symbols", []):
+            by_class[s["asset_class"]] = by_class.get(s["asset_class"], 0) + 1
+        region = region_of[exch]
+        exchanges[exch] = {
+            "exchange_name": EXCHANGE_META.get(exch, {}).get("name"),
+            "region": region,
+            "source_provider": u.get("source_provider"),
+            "coverage_label": u.get("coverage_label"),
+            "discovered": u.get("discovered"),
+            "by_asset_class": by_class,
+            "curated_scanned": curated.get(region, {}),
+            "cached": u.get("cached"),
+            "error": u.get("error"),
+        }
+    return {
+        "status": "ok",
+        "note": ("full_exchange_market discovery is live via EODHD; the scanner "
+                 "still ranks a curated subset. Broad-scan uses a liquidity "
+                 "shortlist (EODHD bulk EOD is plan-gated HTTP 423, so shortlist "
+                 "liquidity is probed per-symbol at scan time)."),
+        "curated_universe_total": len(SETUP_UNIVERSE),
+        "exchanges": exchanges,
+    }
 
 
 @router.get("/api/discover/ledger")

@@ -121,6 +121,28 @@ CONFLICTED_AT:     Final = 3     # >= this many conflicts => "Conflicted Buy Set
 NEAR_PRZ_ATR:      Final = 1.5   # bearish pattern D within this many ATR = conflict
 FAR_PRZ_ATR:       Final = 3.0   # bullish pattern D beyond this = irrelevant, not support
 
+# v3.9.3: Structure Watch RECENCY gate (trading bars = trading days on the daily
+# series). A completed harmonic PRZ (Point D) or a completed Elliott reversal is an
+# ACTIONABLE manual-validation trigger only while it is FRESH: a reversal off a PRZ /
+# correction low typically materialises within ~1-5 trading bars, and past that the
+# structure is played out. Case that motivated this: Mycronic AB (MYCR.ST) bearish
+# Gartley, Point D ~22 bars back, shown for a month under the old age<=90 gate -
+# useless for manual validation. Configurable + testable, not mystical: one named
+# constant, covered by tests; calibrate empirically against the trust ledger's
+# resolved outcomes later. 5 is the tight/actionable end of the researched 1-5 window
+# (raise toward 7 if the section prunes too hard in practice).
+MAX_STRUCTURE_AGE_BARS: Final = 5
+
+# v3.9 (user decision 2026-07-24): completed BULLISH structure now SCORES — the
+# engine was asymmetric (bearish completion penalised via conflicts, bullish
+# completion earned 0 points). This is the symmetric positive axis. Max 8 pts,
+# SUPPORTS-ONLY: it never emits a conflict and NEVER changes the grade (grade
+# stays purely conflict-gated, per the INVE-B safety fix). Split is user-set.
+W_BULL_STRUCT:     Final = 8.0   # component max (structural tier, ~MA100/RSI)
+W_BULL_HARMONIC:   Final = 4.0   # bullish harmonic PRZ support at/below price
+W_BULL_ELLIOTT:    Final = 3.0   # Elliott bullish corrective-continuation (the edge)
+W_BULL_CONFLUENCE: Final = 1.0   # bonus when 2+ bullish structural signals align
+
 # -- Corporate-event gap risk (earnings / ex-dividend inside the target window) --
 # Markets are closed ~17.5h/day: an earnings gap opens straight through a stop,
 # and PEAD means the pre-earnings technical structure often does not survive the
@@ -1111,7 +1133,14 @@ def _elliott_context(highs: list, lows: list, closes: list,
         if pref is None:
             return None
 
+        last_i = len(closes) - 1
         def _ser(count) -> dict:
+            # v3.9.3: bars since the terminal labelled leg ended (Wave C / Wave 5).
+            # Feeds the Structure Watch recency gate so a correction that bottomed
+            # weeks ago is not surfaced as a live reversal-buy trigger. None only if
+            # a valid count somehow carries no legs (defensive; fail-open downstream).
+            end_bar = count.legs[-1].end_index if getattr(count, "legs", None) else None
+            age = (last_i - end_bar) if end_bar is not None else None
             return {
                 "structure": count.count_type.value,
                 "current_wave": count.current_wave,
@@ -1119,6 +1148,7 @@ def _elliott_context(highs: list, lows: list, closes: list,
                 "direction": count.direction.value,
                 "invalidation": float(count.invalidation_level),
                 "guideline_score": int(getattr(count, "guideline_score", 0)),
+                "age_bars": age,
             }
 
         out = _ser(pref)
@@ -1252,6 +1282,145 @@ def _context_conflicts(ctx: Optional[dict], price: float, atr: float):
                 f"Elliott {structure} marked COMPLETE - "
                 "prior structure exhausted; fresh trend evidence required")
     return conflicts, supports, stale
+
+
+def _bullish_structure(ctx: Optional[dict], price: float, atr: float,
+                       extended_atr: float) -> Optional[dict]:
+    """v3.9 — SCORE completed bullish structure so strong technical confirmation
+    actively RAISES conviction, symmetric to the bearish conflicts in
+    _context_conflicts (which subtract). Reads the SAME harmonic/Elliott context
+    and reuses the SAME proximity gates (NEAR_PRZ_ATR, PULLBACK_ATR_MULT) — no
+    new thresholds are invented.
+
+    SUPPORTS-ONLY (user decision 2026-07-24): this never emits a conflict and
+    never changes the grade — grade stays purely conflict-gated (INVE-B safety).
+    It only lifts the 0-100 conviction score / ranking. Max W_BULL_STRUCT (8):
+      · bullish harmonic PRZ at/below price within 1.5 ATR  -> W_BULL_HARMONIC (4)
+      · Elliott bullish corrective-continuation (in-progress, not a late wave-5)
+        -> W_BULL_ELLIOTT (3)   [the documented positive edge; reversals excluded]
+      · 2+ independent bullish structural signals aligning  -> W_BULL_CONFLUENCE (1)
+
+    Returns None when no bullish structural signal is present, so the component
+    is absent from the dynamic denominator (never a zero that penalises)."""
+    if not ctx or atr <= EPS:
+        return None
+    signals: list = []
+    harmonic_pts = 0.0
+    elliott_pts = 0.0
+
+    # -- bullish harmonic PRZ at/below price (mirror of the bearish conflict gate)
+    for h in ctx.get("harmonics", []):
+        if h.get("age_bars", 0) > 90 or not h.get("bullish"):
+            continue
+        d_price = h.get("d_price")
+        if d_price is None or d_price > price:
+            continue  # PRZ must be at/below price to be buy-side support
+        dist_atr = abs(price - d_price) / atr
+        if dist_atr <= NEAR_PRZ_ATR and W_BULL_HARMONIC > harmonic_pts:
+            harmonic_pts = W_BULL_HARMONIC
+            signals.append(
+                f"completed bullish {h.get('name', 'harmonic')} PRZ support "
+                f"{dist_atr:.1f} ATR below price (buy-side reversal zone)")
+
+    # -- Elliott bullish corrective-continuation (same read as _context_conflicts;
+    #    only the CONTINUATION case scores — completed/late-5 stay conflicts, a
+    #    completed bearish count stays a 'needs confirmation' narrative support)
+    ell = ctx.get("elliott")
+    if isinstance(ell, dict):
+        status = str(ell.get("status", "")).upper()
+        direction = str(ell.get("direction", "")).upper()
+        wave = str(ell.get("current_wave", ""))
+        structure = ell.get("structure", "count")
+        if direction == "BULLISH" and "COMPLETE" not in status and "5" not in wave:
+            elliott_pts = W_BULL_ELLIOTT
+            signals.append(
+                f"Elliott bullish {structure} in progress ({wave}) — trend "
+                "structure resuming (corrective-continuation)")
+
+    if harmonic_pts <= 0 and elliott_pts <= 0:
+        return None  # nothing bullish-structural to score
+
+    # -- confluence: 2+ independent bullish signals near price (a pullback landing
+    #    INTO bullish structure counts, but adds no separate points — entry_zone
+    #    already scores the pullback, so this only contributes to the bonus)
+    structural = (1 if harmonic_pts > 0 else 0) + (1 if elliott_pts > 0 else 0)
+    if (0 <= extended_atr <= PULLBACK_ATR_MULT) and structural >= 1:
+        structural += 1
+    confluence_pts = W_BULL_CONFLUENCE if structural >= 2 else 0.0
+    if confluence_pts > 0:
+        signals.append("bullish structural confluence — multiple aligned signals near price")
+
+    earned = min(W_BULL_STRUCT, harmonic_pts + elliott_pts + confluence_pts)
+    return {
+        "earned": round(earned, 2),
+        "max": W_BULL_STRUCT,
+        "signals": signals,
+        "harmonic_pts": round(harmonic_pts, 2),
+        "elliott_pts": round(elliott_pts, 2),
+        "confluence_pts": round(confluence_pts, 2),
+    }
+
+
+def _structure_flags(ctx: Optional[dict], price: float, atr: float) -> dict:
+    """v3.9.1 — compact, immediately-scannable structure flags for the SOTD UI:
+      · bearish_harmonic: the nearest COMPLETED (≤NEAR_PRZ_ATR=1.5) or NEAR-miss
+        (≤FAR_PRZ_ATR=3.0) bearish harmonic. A completed bearish PRZ near price is
+        a buy-VALIDITY red flag (and is already a scored conflict); a near-miss is
+        an early warning that a bearish pattern is approaching completion.
+      · elliott_buy: whether a BUY-signalling Elliott pattern has COMPLETED — a
+        finished bearish correction = downside exhausted = reversal buy — or is an
+        in-progress corrective-continuation (completed=False).
+    Read-only over build_technical_context; mirrors _context_conflicts gates so the
+    flags never disagree with the scored conflicts. Never raises."""
+    out: dict = {"bearish_harmonic": None, "elliott_buy": None}
+    if not ctx or atr <= EPS:
+        return out
+    best = None
+    for h in ctx.get("harmonics", []):
+        # v3.9.3: RECENCY gate. A bearish PRZ is a live buy-validity flag only while
+        # Point D is fresh (<= MAX_STRUCTURE_AGE_BARS trading bars). A month-old
+        # completed pattern is played out, not an active Structure Watch trigger.
+        # (Was age<=90 - kept a 22-bar-old Mycronic Gartley on the list for a month.)
+        if h.get("bullish") or h.get("age_bars", 0) > MAX_STRUCTURE_AGE_BARS:
+            continue
+        d = h.get("d_price")
+        if d is None:
+            continue
+        dist = abs(price - d) / atr
+        if dist <= FAR_PRZ_ATR and (best is None or dist < best["dist_atr"]):
+            best = {"name": h.get("name", "harmonic"), "dist_atr": round(dist, 2),
+                    "status": "completed" if dist <= NEAR_PRZ_ATR else "near",
+                    "d_price": round(float(d), 2),
+                    "age_bars": int(h.get("age_bars", 0)),
+                    "scored_conflict": dist <= NEAR_PRZ_ATR}
+    out["bearish_harmonic"] = best
+    ell = ctx.get("elliott")
+    if isinstance(ell, dict):
+        status = str(ell.get("status", "")).upper()
+        direction = str(ell.get("direction", "")).upper()
+        structure = ell.get("structure", "count")
+        wave = str(ell.get("current_wave", ""))
+        done = "COMPLETE" in status
+        age = ell.get("age_bars")
+        # v3.9.3: a completed correction is a live reversal-buy trigger only if it
+        # bottomed recently (<= MAX_STRUCTURE_AGE_BARS). Fail-open when age is
+        # unknown (None) so a plumbing gap never silently empties the section.
+        stale_completion = age is not None and age > MAX_STRUCTURE_AGE_BARS
+        if direction == "BEARISH" and done and not stale_completion:
+            out["elliott_buy"] = {
+                "structure": structure, "wave": wave, "status": status,
+                "kind": "reversal", "completed": True,
+                "age_bars": (int(age) if age is not None else None),
+                "signal": (f"{structure} correction complete — downside exhausted "
+                           "(reversal buy)")}
+        elif direction == "BULLISH" and not done and "5" not in wave:
+            # In-progress continuation is inherently current; not gated on age.
+            out["elliott_buy"] = {
+                "structure": structure, "wave": wave, "status": status,
+                "kind": "continuation", "completed": False,
+                "age_bars": (int(age) if age is not None else None),
+                "signal": f"bullish {structure} in progress ({wave}) — continuation buy"}
+    return out
 
 
 # ============================================================================
@@ -1549,6 +1718,17 @@ def score_setup(symbol, region, closes, highs, lows, *,
     ctx_conf, ctx_sup, stale_count = _context_conflicts(technical_context, price, atr)
     conflicts.extend(ctx_conf)
     supports.extend(ctx_sup)
+    # v3.9: completed BULLISH structure SCORES (symmetric positive axis to the
+    # bearish conflicts above). Supports-only, max 8 — never a conflict, never
+    # changes the grade. Absent -> None -> excluded from the dynamic denominator.
+    bull_struct = _bullish_structure(technical_context, price, atr, extended_atr)
+    if bull_struct is not None:
+        _comp("bullish_structure", bull_struct["earned"], W_BULL_STRUCT)
+        supports.extend(bull_struct["signals"])
+    # v3.9.1: scannable structure flags for the UI (nearest bearish harmonic —
+    # completed/near-miss — and any completed Elliott buy). Display-only; the
+    # scored conflicts above already reflect the completed-bearish case.
+    struct_flags = _structure_flags(technical_context, price, atr)
     conflicts.extend(event_conflicts)   # earnings / ex-dividend gap risk
 
     # v3.2 structural evidence -> supports / conflicts
@@ -1738,6 +1918,8 @@ def score_setup(symbol, region, closes, highs, lows, *,
                "as_of": news_comp["as_of"],
                "top_items": (news_context or {}).get("items", [])[:4]}
               if news_comp else None),
+        bullish_structure=bull_struct,   # v3.9: scored bullish harmonic/Elliott confluence
+        structure_flags=struct_flags,    # v3.9.1: scannable bearish-harmonic + Elliott-buy flags
         sector_relative_strength=sector_comp,
         spread=spread,
         fx=fx_context,
@@ -1779,6 +1961,7 @@ def score_setup(symbol, region, closes, highs, lows, *,
             "fib_circles": True,
             "harmonics_consulted": technical_context is not None,
             "elliott_consulted": bool(technical_context and technical_context.get("elliott")),
+            "bullish_structure_in_score": bull_struct is not None,   # v3.9
             "earnings_calendar": bool(event_context and event_context.get("next_earnings_date")),
             "dividend_calendar": bool(event_context and event_context.get("next_ex_dividend_date")),
             "ledger_timing_calibration": bool(calibration and calibration.get("reliable")),
