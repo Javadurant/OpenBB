@@ -85,3 +85,12 @@ Documents/
 .streamlit/
 .serena/
 .sentriq/
+
+# ─── Runtime artifacts / live data (never commit — protects the live ledger) ───
+sentriq_ledger.jsonl
+sentriq_ledger.jsonl.*
+sentriq_feedback.jsonl
+quantedge_deliberations.db
+*.log
+*.db
+changes.patch
