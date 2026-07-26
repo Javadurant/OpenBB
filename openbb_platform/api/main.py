@@ -217,6 +217,44 @@ def ready() -> Dict[str, Any]:
         checks["polygon_capabilities"] = polygon_capabilities()
     except Exception as exc:  # noqa: BLE001
         checks["polygon_capabilities"] = {"error": str(exc)[:120]}
+    # v3.7: real live probes for the previously "present but unverified"
+    # providers -- each makes one tiny real API call, doesn't just check
+    # whether the env var is a non-empty string.
+    try:
+        from ai_providers import council_capabilities
+        checks["council_capabilities"] = council_capabilities()
+    except Exception as exc:  # noqa: BLE001
+        checks["council_capabilities"] = {"error": str(exc)[:120]}
+    try:
+        from api.firecrawl_client import firecrawl_capabilities
+        checks["firecrawl_capabilities"] = firecrawl_capabilities()
+    except Exception as exc:  # noqa: BLE001
+        checks["firecrawl_capabilities"] = {"error": str(exc)[:120]}
+    try:
+        from api.apify_client import apify_capabilities
+        checks["apify_capabilities"] = apify_capabilities()
+    except Exception as exc:  # noqa: BLE001
+        checks["apify_capabilities"] = {"error": str(exc)[:120]}
+    try:
+        from api.bigdata_client import bigdata_capabilities
+        checks["bigdata_capabilities"] = bigdata_capabilities()
+    except Exception as exc:  # noqa: BLE001
+        checks["bigdata_capabilities"] = {"error": str(exc)[:120]}
+    try:
+        from api.lumin_client import lumin_capabilities
+        checks["lumin_capabilities"] = lumin_capabilities()
+    except Exception as exc:  # noqa: BLE001
+        checks["lumin_capabilities"] = {"error": str(exc)[:120]}
+    try:
+        from api.coindesk_client import coindesk_capabilities
+        checks["coindesk_capabilities"] = coindesk_capabilities()
+    except Exception as exc:  # noqa: BLE001
+        checks["coindesk_capabilities"] = {"error": str(exc)[:120]}
+    try:
+        from api.tvremix_client import tvremix_capabilities
+        checks["tvremix_capabilities"] = tvremix_capabilities()
+    except Exception as exc:  # noqa: BLE001
+        checks["tvremix_capabilities"] = {"error": str(exc)[:120]}
     git_commit = None
     try:
         import subprocess as _sp
@@ -230,7 +268,7 @@ def ready() -> Dict[str, Any]:
               and checks.get("data_ingestion_importable"))
     return {"ok": ok, "checks": checks, "uptime_sec": int(_t.time() - _STARTED_AT),
             "mode": _os.getenv("SENTRIQ_ENV", "dev"), "git_commit": git_commit,
-            "version": "3.3.0"}
+            "version": "3.7.0"}
 
 # ── Key status (never exposes values) ────────────────────────────────────
 @app.get("/api/keys/status")

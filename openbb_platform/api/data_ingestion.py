@@ -30,11 +30,14 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import json
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Final, Optional, Sequence
 
 # ── Logging: dedicated error log file (council-mandated) ──────────────────
@@ -53,6 +56,14 @@ SCRAPE_CACHE_TTL_S:   Final = 3600.0     # scraped NAV cache TTL
 PROVIDER_TIMEOUT_S:   Final = 20.0       # per-provider hard timeout
 EPS:                  Final = 1e-9
 SECONDS_PER_DAY:      Final = 86_400.0
+
+# v3.9.2: shared on-disk OHLCV cache. The full 18k/945 universe made a single
+# Setup-of-the-Day / broad scan fetch ~430 symbols; back-to-back scans throttled
+# yfinance (DataMissing for minutes). A short-TTL disk cache lets repeated scans
+# reuse bars instead of re-hitting the network — eliminating the throttle risk.
+# TTL is deliberately << MAX_STALENESS_DAYS so a cache hit is never stale.
+_OHLCV_CACHE_DIR = Path(os.getenv("SENTRIQ_OHLCV_CACHE", "/tmp/sentriq_ohlcv"))
+_OHLCV_TTL_S:         Final = float(os.getenv("SENTRIQ_OHLCV_TTL_S", str(6 * 3600.0)))
 
 
 # ── Output contracts ──────────────────────────────────────────────────────
@@ -439,6 +450,56 @@ class ProviderManager:
 
 
 # ── Facade ───────────────────────────────────────────────────────────────--
+def _ohlcv_key(symbol: str, asset_class: str, lookback_days: Optional[int]) -> str:
+    """Filesystem-safe cache key for one (symbol, class, lookback) series."""
+    safe = "".join(c if (c.isalnum() or c in "-._") else "_" for c in symbol)
+    return f"{safe}__{asset_class}__{lookback_days if lookback_days else 'def'}.json"
+
+
+def _ohlcv_cache_read(symbol: str, asset_class: str,
+                      lookback_days: Optional[int]) -> Optional["PriceSeries"]:
+    """Return a cached PriceSeries if the file exists and is within TTL, else None.
+    Best-effort: any error (missing/corrupt/parse) simply misses the cache."""
+    try:
+        fp = _OHLCV_CACHE_DIR / _ohlcv_key(symbol, asset_class, lookback_days)
+        if not fp.exists() or (time.time() - fp.stat().st_mtime) > _OHLCV_TTL_S:
+            return None
+        d = json.loads(fp.read_text())
+        pts = [DataPoint(datetime.fromisoformat(p[0]), p[1], p[2], p[3], p[4], p[5])
+               for p in d.get("points", [])]
+        if len(pts) < MIN_POINTS:
+            return None
+        meta = dict(d.get("meta") or {})
+        meta["ohlcv_cache"] = "hit"
+        return PriceSeries(
+            symbol=d["symbol"], points=pts, source=d["source"],
+            as_of=datetime.fromisoformat(d["as_of"]),
+            asset_class=d.get("asset_class", asset_class),
+            currency=d.get("currency"), meta=meta)
+    except Exception:  # noqa: BLE001 - cache is best-effort, never breaks the fetch
+        return None
+
+
+def _ohlcv_cache_write(symbol: str, asset_class: str, lookback_days: Optional[int],
+                       series: "PriceSeries") -> None:
+    """Serialize a freshly-fetched PriceSeries to disk. Best-effort; never raises."""
+    try:
+        if not series or len(series.points) < MIN_POINTS:
+            return
+        _OHLCV_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "symbol": series.symbol, "source": series.source,
+            "as_of": series.as_of.isoformat(), "asset_class": series.asset_class,
+            "currency": series.currency, "meta": series.meta,
+            "points": [[p.ts.isoformat(), p.open, p.high, p.low, p.close, p.volume]
+                       for p in series.points],
+        }
+        (_OHLCV_CACHE_DIR / _ohlcv_key(symbol, asset_class, lookback_days)).write_text(
+            json.dumps(payload))
+    except Exception:  # noqa: BLE001 - caching is best-effort
+        logger.debug("ohlcv cache write failed for %s", symbol, exc_info=True)
+
+
 class DataIngestionService:
     """Top-level entry point. Wires the default tiered cascade and exposes a
     single async `get_series`. Callers catch DataMissingException to render an
@@ -454,7 +515,16 @@ class DataIngestionService:
 
     async def get_series(self, symbol: str, asset_class: str = "equity",
                          lookback_days: Optional[int] = None) -> PriceSeries:
-        return await self.manager.get(symbol, asset_class, lookback_days)
+        # v3.9.2: serve from the shared on-disk OHLCV cache when fresh (TTL). This
+        # is what eliminates the yfinance throttling — repeated scans reuse bars
+        # instead of re-fetching ~430 symbols each time. A miss fetches via the
+        # provider cascade and populates the cache. Cache layer never raises.
+        cached = _ohlcv_cache_read(symbol, asset_class, lookback_days)
+        if cached is not None:
+            return cached
+        series = await self.manager.get(symbol, asset_class, lookback_days)
+        _ohlcv_cache_write(symbol, asset_class, lookback_days, series)
+        return series
 
     async def get_many(self, symbols: list[tuple[str, str]]) -> dict[str, Optional[PriceSeries]]:
         """Fetch many (symbol, asset_class) pairs concurrently. Missing -> None."""
