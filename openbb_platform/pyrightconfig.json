@@ -1,0 +1,21 @@
+{
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Darwin",
+  "venvPath": ".",
+  "venv": "venv",
+  "include": ["."],
+  "exclude": [
+    "**/venv/**",
+    "**/node_modules/**",
+    "**/__pycache__/**",
+    "**/*.pyc",
+    "**/web/**"
+  ],
+  "typeCheckingMode": "basic",
+  "useLibraryCodeForTypes": true,
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none",
+  "reportGeneralTypeIssues": "none",
+  "reportUnusedImport": "none",
+  "reportAttributeAccessIssue": "none"
+}
