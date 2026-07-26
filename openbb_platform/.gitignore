@@ -94,3 +94,8 @@ quantedge_deliberations.db
 *.log
 *.db
 changes.patch
+
+# ─── Vendored external MCP servers (own .git) + direnv (SENTRIQ, 2026-07-26) ───
+glif-mcp-server/
+lumin-mcp-server/
+.envrc

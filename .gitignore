@@ -61,3 +61,6 @@ obb/*
 *.pkg
 *.exe
 build/conda/tmp
+
+# Accidental nested clone (SENTRIQ, 2026-07-26)
+/OpenBB/
