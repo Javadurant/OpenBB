@@ -99,3 +99,6 @@ changes.patch
 glif-mcp-server/
 lumin-mcp-server/
 .envrc
+
+# Backtest eval output (write-only, regenerable, keep on disk)
+sentriq_ledger_v33_eval.jsonl
