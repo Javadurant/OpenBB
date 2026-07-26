@@ -1,0 +1,87 @@
+# ─── Python / build caches ────────────────────────────────────────────────
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# ─── Virtual environments / direnv ────────────────────────────────────────
+venv/
+.venv/
+.direnv/
+
+# ─── Frontend deps / build output ─────────────────────────────────────────
+node_modules/
+
+# ─── OS / IDE ─────────────────────────────────────────────────────────────
+.DS_Store
+.vscode/
+.idea/
+
+# ─── Secrets ──────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.local
+
+# ─── Backup / scratch / regenerable text outputs ──────────────────────────
+*.bak
+audit_report.txt
+scan_report.txt
+google_context.txt
+my_project_for_google.txt
+project_structure.txt
+project_file_names.txt
+
+# ─── Personal / private content ───────────────────────────────────────────
+trading_books/
+notebooklm_exports/
+api/notebooklm_exports/
+Documents/
+
+# ─── Vendored upstream OpenBB Platform (do not republish) ─────────────────
+# Upstream README + project metadata
+/README.md
+/pyproject.toml
+# Upstream platform package + its support layout under core/
+/core/*
+!/core/TRADING_DOMAIN_KNOWLEDGE_REFERENCE.py
+# Upstream extensions (whitelist your custom uscongress/)
+/extensions/*
+!/extensions/uscongress/
+!/extensions/uscongress/**
+# Upstream providers (you have no custom providers)
+/providers/
+# Upstream OBBject extensions
+/obbject_extensions/
+# Upstream test surface
+/tests/
+# Leftover Tailwind devDependency from the old `web/` prototype
+/package.json
+/pnpm-lock.yaml
+
+# ─── Old / superseded prototypes (now in the sentriq repo) ────────────────
+/web/
+/my-agent/
+/quantedge-agent/
+
+# ─── Duplicate organizational scaffolds (same files exist at root) ────────
+/MASTER/
+/PLATFORM_BUILD/
+/INTEGRATION/
+/ENV-WIRING/
+.coverage
+.env
+
+# ─── Timestamped backups + agent/tooling dirs (SENTRIQ, 2026-07-26) ───
+# Non-destructive: .bak snapshots are PRESERVED on disk (project rule: never
+# delete .bak), just excluded from git status.
+*.bak.*
+.claude/
+.claude-flow/
+.agents/
+.streamlit/
+.serena/
+.sentriq/
