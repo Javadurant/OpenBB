@@ -36,7 +36,9 @@ from .setup_ledger import (
     MIN_BARS_TO_SCORE,
     MIN_SAMPLE_FOR_RATE,
     _parse_window_days,
+    _usable_bar,
     classify,
+    usable_bar_count,
 )
 from .setup_scanner import score_setup
 
@@ -62,9 +64,14 @@ def _classify_directional(entry: float, stop: float, target: float, direction: s
         return classify(entry, stop, target, fut_highs, fut_lows, horizon)
     n = min(len(fut_highs), len(fut_lows), max(1, horizon))
     for i in range(n):
-        hi, lo = fut_highs[i], fut_lows[i]
-        if hi is None or lo is None or not (math.isfinite(hi) and math.isfinite(lo)):
+        # Same predicate as the long path. A bare isfinite() check let a zero
+        # low through, and for a SHORT `lo <= target` then fired
+        # unconditionally - fabricating a WIN from an empty bar. Mirror image
+        # of the false LOSS fixed on the long side 2026-08-08.
+        bar = _usable_bar(fut_highs[i], fut_lows[i])
+        if bar is None:
             continue
+        hi, lo = bar
         hit_target = lo <= target   # price fell to the (lower) target
         hit_stop = hi >= stop       # price rose to the (higher) stop
         if hit_target and hit_stop:
@@ -303,8 +310,17 @@ def walk_forward(ts: list, highs: list[float], lows: list[float], closes: list[f
             continue
         # Honest expiry: not enough subsequent bars to fill the horizon -> stop here
         # rather than scoring half-formed trades at the right edge of history.
-        if outcome == "EXPIRED" and len(fut_h) < horizon:
-            break
+        if outcome == "EXPIRED":
+            if len(fut_h) < horizon:
+                break            # right edge of history: no later setup can
+                                 # fill the horizon either, so stop scanning.
+            if usable_bar_count(fut_h, fut_l, horizon) < horizon:
+                # Enough bars exist, but too few are USABLE. That is a data-
+                # quality hole mid-history, NOT the end of history - skip this
+                # setup and keep scanning. Breaking here would silently
+                # truncate the study and drop every later setup.
+                i += step
+                continue
         ts_i = ts[i]
         trades.append({
             "as_of": ts_i.date().isoformat() if hasattr(ts_i, "date") else str(ts_i),

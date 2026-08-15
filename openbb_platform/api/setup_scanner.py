@@ -322,19 +322,53 @@ def _rsi(closes: list, period: int = RSI_PERIOD) -> Optional[float]:
     return 100.0 - (100.0 / (1.0 + rs))
 
 
+def _usable_price(value: Any) -> Optional[float]:
+    """Coerce one OHLCV field to a usable price, or report it unusable.
+
+    Returns None for anything that cannot be a traded price: missing, boolean
+    (float(True) would silently become 1.0), non-numeric, NaN/infinity, or
+    non-positive. NOTHING is substituted, interpolated or clamped - an
+    unusable input is reported as unusable so the caller can refuse rather
+    than guess. Never raises."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0.0:
+        return None
+    return f
+
+
 def _atr(highs: list, lows: list, closes: list, period: int = ATR_PERIOD) -> Optional[float]:
-    n = len(closes)
+    """Average true range over the last `period` bars.
+
+    Structurally invalid bars are SKIPPED, never repaired. This matters for
+    NAV-style instruments: a provider that reports high=low=0.0 alongside a
+    valid close collapses the true range to max(0, |0-c|, |0-c|) = c, so ATR
+    converges on the ASSET PRICE itself and drives stop below zero. A bar is
+    usable only when high, low and the previous close are all positive finite
+    numbers and high >= low; a full `period` of valid true ranges is required,
+    otherwise None. Refusing beats inventing a volatility estimate."""
+    n = min(len(highs), len(lows), len(closes))
     if n < period + 1:
         return None
     trs = []
     for i in range(n - period, n):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-        trs.append(tr)
-    return sum(trs) / len(trs) if trs else None
+        hi = _usable_price(highs[i])
+        lo = _usable_price(lows[i])
+        prev_close = _usable_price(closes[i - 1])
+        if hi is None or lo is None or prev_close is None or hi < lo:
+            continue
+        trs.append(max(
+            hi - lo,
+            abs(hi - prev_close),
+            abs(lo - prev_close),
+        ))
+    if len(trs) < period:
+        return None
+    return sum(trs) / len(trs)
 
 
 def _sma(values: list, period: int) -> Optional[float]:
@@ -1564,6 +1598,18 @@ def score_setup(symbol, region, closes, highs, lows, *,
     stop = round(entry - STOP_ATR_MULT * atr, 2)
     risk = entry - stop
     target = round(entry + REWARD_RISK * risk, 2)
+
+    # -- geometry gate: levels that are not strictly ordered are not a setup.
+    #    A long setup requires 0 < stop < entry < target. Malformed provider
+    #    OHLCV (e.g. high=low=0.0 on a NAV series) inflates ATR toward the
+    #    asset price and pushes stop to or below zero, which would otherwise
+    #    be published and logged as a tradeable level. Refuse here, before the
+    #    setup becomes ledger-eligible. No threshold is invented and no level
+    #    is repaired - the setup is simply not emitted. --
+    if not all(math.isfinite(v) for v in (entry, stop, target)):
+        return None
+    if not (0.0 < stop < entry < target):
+        return None
 
     # Exchange calendar for target-date math (crypto trades 7 days/week).
     if asset_class == "crypto":

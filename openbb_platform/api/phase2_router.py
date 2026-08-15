@@ -5,13 +5,16 @@ All call REAL engine functions, no stubs.
 """
 from __future__ import annotations
 
+import hmac
 import logging
+import os as _os
 import sys
+import threading
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
 from pydantic import BaseModel
 
 warnings.filterwarnings("ignore")
@@ -940,23 +943,32 @@ def _fetch_and_score(entry: tuple[str, str, str],
         return None
 
 
-def _structured_error(code: str, exc: Exception, source: str, rid: str):
-    """Local-dev reliability contract: routes must NEVER surface as a bare
-    'Failed to fetch' — they return this JSON error envelope instead."""
+def _error_envelope(code: str, message: str, source: str, rid: str, *,
+                    status_code: int, retryable: bool, details: str):
+    """THE project error shape. One construction site so no route can drift
+    into a second, incompatible envelope."""
     from datetime import datetime as _dt, timezone as _tz
     from fastapi.responses import JSONResponse
-    return JSONResponse(status_code=503, content={
+    return JSONResponse(status_code=status_code, content={
         "ok": False,
         "error": {
             "code": code,
-            "message": str(exc)[:300],
-            "details": type(exc).__name__,
-            "retryable": True,
+            "message": message[:300],
+            "details": details,
+            "retryable": retryable,
             "source": source,
             "timestamp": _dt.now(_tz.utc).isoformat(timespec="seconds"),
             "request_id": rid,
         },
     })
+
+
+def _structured_error(code: str, exc: Exception, source: str, rid: str):
+    """Local-dev reliability contract: routes must NEVER surface as a bare
+    'Failed to fetch' — they return this JSON error envelope instead."""
+    # Behaviour-identical delegation: same 503, same retryable=True, same fields.
+    return _error_envelope(code, str(exc), source, rid, status_code=503,
+                           retryable=True, details=type(exc).__name__)
 
 
 @router.get("/api/discover/setup-of-the-day")
@@ -979,6 +991,169 @@ def setup_of_the_day(refresh: bool = False):
             stale["request_id"] = rid
             return stale
         return _structured_error("SETUP_SCAN_FAILED", exc, "setup_scanner", rid)
+
+
+# ── Authorised trust-ledger logging — the ONLY API write path ────────────────
+# Scans are read-only. Persisting one is a deliberate MANUAL operator action:
+# no scheduler, no frontend, no recovery script (governance decision 2026-08-06).
+#
+# LOOPBACK-ONLY, UNCONDITIONALLY. No remote escape hatch. Forwarding headers
+# (X-Forwarded-For / X-Real-IP) are NEVER consulted — they are attacker-
+# controlled. Only the real TCP peer (request.client.host) is trusted.
+# ⚠ A reverse proxy in front makes the peer the PROXY, silently widening this
+#   gate to the whole internet. Deploying behind a proxy INVALIDATES this
+#   control and REQUIRES a new security review before it is enabled.
+#
+# ACCOUNTABILITY LIMIT: the credential is a SHARED SECRET. It authenticates
+# "someone who holds the token", NOT an individual operator. There is no
+# per-user identity, no signature, and no non-repudiation. Available audit
+# fields are: request_id, peer (always loopback), written, not_written.
+#
+# TOKEN IN A HEADER, NEVER A QUERY PARAM: uvicorn's access log records the PATH
+# (verified live: '"GET /api/health HTTP/1.1" 200 OK') but not headers, so a
+# query token would be written to /tmp/sentriq_api.log and any proxy log.
+_LEDGER_LOG_TOKEN_ENV = "SENTRIQ_LEDGER_LOG_TOKEN"
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
+
+# Rate limit: stdlib only (no limiter dependency is installed). Counts EVERY
+# attempt BEFORE credential validation, so invalid attempts are throttled too.
+# STATE IS PER-PROCESS AND IN-MEMORY: it resets on restart and is not shared
+# across workers. A brute-force speed bump, NOT a security boundary.
+_LEDGER_LOG_RATE_MAX = 6
+_LEDGER_LOG_RATE_WINDOW_SEC = 60.0
+_LEDGER_LOG_HITS: list[float] = []
+_LEDGER_LOG_LOCK = threading.Lock()
+
+
+def _ledger_log_rate_ok() -> bool:
+    now = _time.monotonic()
+    with _LEDGER_LOG_LOCK:
+        _LEDGER_LOG_HITS[:] = [t for t in _LEDGER_LOG_HITS
+                               if now - t < _LEDGER_LOG_RATE_WINDOW_SEC]
+        if len(_LEDGER_LOG_HITS) >= _LEDGER_LOG_RATE_MAX:
+            return False
+        _LEDGER_LOG_HITS.append(now)
+        return True
+
+
+def _env_file_mode_check() -> Optional[str]:
+    """Policy gate: enabling logging requires .env at mode 600.
+
+    Returns None when OK, else a refusal reason. FAIL-CLOSED: any OSError
+    (permission denied, unreadable parent, race with deletion) refuses.
+    NEVER returns or logs a filesystem path or an exception message — only the
+    exception CLASS NAME, server-side. The caller maps the reason to a generic
+    response so nothing about the filesystem reaches the client."""
+    try:
+        st = _os.stat(Path(__file__).resolve().parent.parent / ".env")
+    except FileNotFoundError:
+        return None                     # no .env; token came from the process env
+    except OSError as exc:
+        logger.warning("ledger logging: credential-file check failed (%s)",
+                       type(exc).__name__)          # class name only
+        return "env_check_failed"                   # FAIL CLOSED
+    if st.st_mode & 0o077:
+        return "insecure_env_permissions"
+    return None
+
+
+def _ledger_logging_authorised(token: Optional[str], peer: Optional[str]
+                               ) -> tuple[bool, str]:
+    """(authorised, reason). Never logs, echoes, or returns the token.
+    peer=None (request.client absent) is treated as NOT loopback — fail closed."""
+    if peer not in _LOOPBACK_HOSTS:
+        return False, "remote_denied"
+    expected = _os.getenv(_LEDGER_LOG_TOKEN_ENV, "").strip()
+    if not expected:
+        return False, "not_configured"
+    env_reason = _env_file_mode_check()
+    if env_reason:
+        return False, env_reason
+    if not token or not hmac.compare_digest(token, expected):
+        return False, "forbidden"
+    return True, "authorised"
+
+
+# (status, client-facing message, retryable). Messages carry NO filesystem
+# paths, NO exception text, and NO hint about which internal check failed.
+_LEDGER_LOG_ERRORS = {
+    "rate_limited":             (429, "too many logging attempts; retry later", True),
+    "remote_denied":            (403, "ledger logging is loopback-only", False),
+    "not_configured":           (503, "ledger logging is not configured on this server", False),
+    "insecure_env_permissions": (503, "ledger logging is disabled by server policy", False),
+    "env_check_failed":         (503, "ledger logging is disabled by server policy", False),
+    "forbidden":                (403, "missing or invalid ledger-logging credential", False),
+}
+
+
+@router.post("/api/discover/setup-of-the-day/log")
+def setup_of_the_day_log(
+    request: Request,
+    x_sentriq_ledger_token: Optional[str] = Header(default=None),
+):
+    """Persist the CURRENT scan's top setups to the LIVE trust ledger.
+
+    Deliberate, authorised, manual. Idempotent per date:symbol:grade -
+    setup_ledger.log_setup() re-checks the key under its write lock, so a
+    repeated call on the same day writes nothing. Reuses the warm cache so it
+    never forces a second full scan."""
+    import uuid as _uuid
+    rid = _uuid.uuid4().hex[:12]
+
+    # Rate limit FIRST: every attempt counts, valid or not.
+    if not _ledger_log_rate_ok():
+        status, msg, retry = _LEDGER_LOG_ERRORS["rate_limited"]
+        return _error_envelope("LEDGER_LOGGING_RATE_LIMITED", msg, "setup_ledger",
+                               rid, status_code=status, retryable=retry,
+                               details="rate_limited")
+    peer = getattr(getattr(request, "client", None), "host", None)
+    ok, reason = _ledger_logging_authorised(x_sentriq_ledger_token, peer)
+    if not ok:
+        status, msg, retry = _LEDGER_LOG_ERRORS[reason]
+        logger.warning("ledger logging refused [reason=%s peer=%s request_id=%s]",
+                       reason, peer, rid)          # never the token
+        return _error_envelope("LEDGER_LOGGING_" + reason.upper(), msg,
+                               "setup_ledger", rid, status_code=status,
+                               retryable=retry, details=reason)
+
+    scan = _setup_of_the_day_impl(refresh=False)   # warm cache when available
+    if scan.get("status") != "ok":
+        return _error_envelope("SCAN_UNAVAILABLE", "no usable scan to log",
+                               "setup_scanner", rid, status_code=502,
+                               retryable=True, details="scan_status_not_ok")
+
+    from .setup_ledger import log_setup as _log_setup
+    written = not_written = candidates = 0
+    for _region, _classes in (scan.get("boxes") or {}).items():
+        for _ac, _box in _classes.items():
+            _top = _box.get("top_setup")
+            if not _top:
+                continue
+            candidates += 1
+            if _log_setup(_top):          # path=None -> live ledger, deliberately
+                written += 1
+            else:
+                not_written += 1
+    logger.info("ledger logging [request_id=%s peer=%s candidates=%d written=%d "
+                "not_written=%d]", rid, peer, candidates, written, not_written)
+    return {
+        "status": "ok",
+        "request_id": rid,
+        "ledger_logging": {
+            "logged": written > 0,
+            "candidates": candidates,
+            "written": written,
+            # CONSERVATIVE: log_setup() returns False for duplicate key, invalid
+            # fields, OR a caught OSError/ValueError/TypeError. It cannot
+            # distinguish them without changing its return contract, so this
+            # MUST NOT be reported as a duplicate count.
+            "not_written": not_written,
+            "not_written_note": "duplicate, invalid, or write error - not distinguishable",
+            "idempotency_key": "date:symbol:grade",
+            "scan_cached": bool(scan.get("cached")),
+            "identity_note": "shared credential; not attributable to an individual",
+        },
+    }
 
 
 _CONFLICTED_TTL_SEC = 1800.0  # match the setup-of-the-day 30-min cadence
@@ -1285,18 +1460,14 @@ def _setup_of_the_day_impl(refresh: bool = False) -> dict[str, Any]:
                 "candidates":  candidates,
             }
 
-    # <- NEW [Phase3-Step3]: log surfaced top setups to the trust ledger.
-    #    Single-threaded post-assembly (avoids concurrent-write races);
-    #    idempotent per date:symbol:grade; never breaks the scan.
-    try:
-        from .setup_ledger import log_setup as _log_setup
-        for _region in boxes:
-            for _ac in boxes[_region]:
-                _top = boxes[_region][_ac].get("top_setup")
-                if _top:
-                    _log_setup(_top)
-    except Exception:  # noqa: BLE001
-        logger.warning("ledger logging skipped", exc_info=True)
+    # EMERGENCY CONTAINMENT (2026-08-06): the implicit trust-ledger write that
+    # lived here is DELETED. A GET must never mutate financial records, and this
+    # one did so unauthenticated from any browser tab — observed appending 5 rows
+    # at 03:34 UTC and 10 rows at 16:43 local the same day. The write also
+    # completed BEFORE uvicorn emitted its access-log line, so the access log
+    # could not detect it. An authorised replacement path is prepared but NOT
+    # applied; it awaits human policy approval (token owner, rotation,
+    # revocation, cadence, rate limit).
 
     # v3.6: cross-reference each equity box against the FULL provider exchange
     # list (EODHD), so the UI can state "N of M" honestly — a curated subset of

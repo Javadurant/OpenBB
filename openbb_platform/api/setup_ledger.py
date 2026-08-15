@@ -36,6 +36,7 @@ from typing import Any, Final, Optional, TypedDict
 logger = logging.getLogger("setup_ledger")
 
 _LEDGER_PATH: Final = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sentriq_ledger.jsonl")
+LIVE_LEDGER_PATH: Final = _LEDGER_PATH   # public: for identity checks by tools/tests
 MIN_SAMPLE_FOR_RATE: Final = 5      # below this, report "insufficient data"
 MIN_BARS_TO_SCORE:   Final = 60     # need history depth before an as_of to score
 DEFAULT_WINDOW_DAYS: Final = 18     # fallback horizon if a window can't be parsed
@@ -81,12 +82,32 @@ def make_key(date_iso: str, symbol: str, grade: str) -> str:
     return f"{date_iso}:{symbol}:{grade}"
 
 
-def _read_all() -> list[dict]:
-    if not os.path.exists(_LEDGER_PATH):
+def _resolve_ledger(path: Optional[str], *, writing: bool) -> str:
+    """Resolve a ledger path, refusing accidental LIVE-ledger writes.
+
+    path=None keeps the historical behaviour exactly: the live ledger. An
+    EXPLICIT path that resolves to the live ledger while WRITING is always a
+    mistake - the caller asked for a parallel file (backtest, recalibration,
+    eval) and would silently corrupt the production trust ledger instead.
+    Reads may target the live ledger explicitly; that is harmless."""
+    if path is None:
+        return _LEDGER_PATH
+    resolved = os.path.realpath(path)
+    if writing and resolved == os.path.realpath(LIVE_LEDGER_PATH):
+        raise ValueError(
+            "refusing to write: explicit ledger path resolves to the LIVE "
+            f"ledger ({LIVE_LEDGER_PATH}). Pass a distinct parallel file, or "
+            "omit path= to write the live ledger deliberately.")
+    return resolved
+
+
+def _read_all(path: Optional[str] = None) -> list[dict]:
+    target = _resolve_ledger(path, writing=False)
+    if not os.path.exists(target):
         return []
     out: list[dict] = []
     try:
-        with open(_LEDGER_PATH, "r", encoding="utf-8") as fh:
+        with open(target, "r", encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
                 if line:
@@ -99,14 +120,23 @@ def _read_all() -> list[dict]:
     return out
 
 
-def _existing_keys() -> set[str]:
-    return {r.get("key", "") for r in _read_all()}
+def _existing_keys(path: Optional[str] = None) -> set[str]:
+    return {r.get("key", "") for r in _read_all(path)}
 
 
-def log_setup(setup: dict, *, date_iso: Optional[str] = None) -> bool:
+def log_setup(setup: dict, *, date_iso: Optional[str] = None,
+              path: Optional[str] = None) -> bool:
     """Append a setup snapshot to the ledger (idempotent per date:symbol:grade).
-    Returns True if written, False if a duplicate/invalid. Never raises."""
-    try:
+    Returns True if written, False if a duplicate/invalid.
+
+    Never raises on DATA problems (the historical contract). The ONE exception
+    is a misdirected write TARGET: _resolve_ledger is called OUTSIDE the try so
+    an explicit path resolving to the LIVE ledger raises loudly instead of being
+    swallowed into a silent False. A caller that asked for a parallel file and
+    got the production ledger must fail, not quietly no-op.
+    path=None -> live ledger (unchanged)."""
+    ledger_path = _resolve_ledger(path, writing=True)  # loud: deliberately outside the try
+    try:                                              # NB: `target` below is the PRICE target
         symbol = setup.get("symbol")
         grade = setup.get("grade")
         entry = setup.get("entry")
@@ -116,7 +146,7 @@ def log_setup(setup: dict, *, date_iso: Optional[str] = None) -> bool:
             return False
         as_of = date_iso or setup.get("as_of") or datetime.now(timezone.utc).date().isoformat()
         key = make_key(as_of, symbol, grade)
-        if key in _existing_keys():
+        if key in _existing_keys(ledger_path):
             return False
         rec: LedgerEntry = LedgerEntry(
             key=key, date=as_of, symbol=symbol, name=setup.get("name", symbol),
@@ -133,9 +163,9 @@ def log_setup(setup: dict, *, date_iso: Optional[str] = None) -> bool:
             logged_at=datetime.now(timezone.utc).isoformat(),
         )
         with _WRITE_LOCK:
-            if make_key(as_of, symbol, grade) in _existing_keys():
+            if make_key(as_of, symbol, grade) in _existing_keys(ledger_path):
                 return False  # re-check under lock (TOCTOU guard)
-            with open(_LEDGER_PATH, "a", encoding="utf-8") as fh:
+            with open(ledger_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec) + "\n")
         return True
     except (OSError, ValueError, TypeError) as exc:
@@ -143,16 +173,68 @@ def log_setup(setup: dict, *, date_iso: Optional[str] = None) -> bool:
         return False
 
 
+def _usable_price(value: Any) -> Optional[float]:
+    """Coerce one OHLCV field to a usable price, or report it unusable.
+
+    Mirrors setup_scanner._usable_price deliberately: setup_scanner imports
+    this module, so importing it back at module level would create a cycle.
+    Returns None for missing, boolean (float(True) would silently become 1.0),
+    non-numeric, NaN/infinity or non-positive values. Never raises."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0.0:
+        return None
+    return f
+
+
+def _usable_bar(hi_raw: Any, lo_raw: Any) -> Optional[tuple[float, float]]:
+    """Return (high, low) when the bar is structurally usable, else None.
+
+    THE single definition of "usable bar" for barrier testing. classify(),
+    usable_bar_count() and symbol_backtest's short path all call this, so they
+    cannot disagree about which bars count - a counter that drifted from the
+    classifier would reintroduce this defect one level up. Rejects missing,
+    boolean, non-numeric, NaN/infinity and non-positive prices (via
+    _usable_price) plus inverted bars. Nothing is substituted or repaired."""
+    hi = _usable_price(hi_raw)
+    lo = _usable_price(lo_raw)
+    if hi is None or lo is None or hi < lo:
+        return None
+    return hi, lo
+
+
+def usable_bar_count(fut_highs: list, fut_lows: list, horizon: int) -> int:
+    """How many of the first `horizon` future bars are structurally usable.
+
+    Callers need this to tell "the horizon passed without a touch" apart from
+    "no usable bar was ever seen". Both make classify() return EXPIRED; only the
+    first is an outcome. Bounded at `horizon` exactly as classify() bounds its
+    scan, so the two always inspect the same window."""
+    n = min(len(fut_highs), len(fut_lows), max(1, horizon))
+    return sum(1 for i in range(n)
+               if _usable_bar(fut_highs[i], fut_lows[i]) is not None)
+
+
 def classify(entry: float, stop: float, target: float,
              fut_highs: list, fut_lows: list, horizon: int) -> tuple[str, Optional[int]]:
     """First-touch barrier classification on subsequent daily bars.
-    Returns (outcome, bars_to_resolve). Float-safe: only >= / <= comparisons."""
+    Returns (outcome, bars_to_resolve). Float-safe: only >= / <= comparisons.
+
+    Structurally invalid future bars are SKIPPED, not interpreted. A zero low
+    is finite, so a bare isfinite() check would let high=low=0.0 (seen from
+    NAV-only providers) satisfy `lo <= stop` and manufacture a first-bar LOSS
+    against a setup that never actually traded there. Absence of a usable bar
+    is absence of evidence, never evidence of a touch."""
     n = min(len(fut_highs), len(fut_lows), max(1, horizon))
     for i in range(n):
-        hi = fut_highs[i]
-        lo = fut_lows[i]
-        if hi is None or lo is None or not (math.isfinite(hi) and math.isfinite(lo)):
+        bar = _usable_bar(fut_highs[i], fut_lows[i])
+        if bar is None:
             continue
+        hi, lo = bar
         hit_target = hi >= target
         hit_stop = lo <= stop
         if hit_target and hit_stop:
@@ -164,18 +246,20 @@ def classify(entry: float, stop: float, target: float,
     return "EXPIRED", None
 
 
-def _rewrite(records: list[dict]) -> None:
-    tmp = _LEDGER_PATH + ".tmp"
+def _rewrite(records: list[dict], path: Optional[str] = None) -> None:
+    target = _resolve_ledger(path, writing=True)
+    tmp = target + ".tmp"
     with _WRITE_LOCK:
         with open(tmp, "w", encoding="utf-8") as fh:
             for r in records:
                 fh.write(json.dumps(r) + "\n")
-        os.replace(tmp, _LEDGER_PATH)
+        os.replace(tmp, target)
 
 
-def aggregate() -> dict[str, Any]:
-    """Honest aggregate: win-rate by grade with sample size + methodology."""
-    records = _read_all()
+def aggregate(path: Optional[str] = None) -> dict[str, Any]:
+    """Honest aggregate: win-rate by grade with sample size + methodology.
+    path=None -> live ledger (unchanged); explicit reads are allowed."""
+    records = _read_all() if path is None else _read_all(path)
     resolved = [r for r in records if r.get("outcome") in ("WIN", "LOSS", "AMBIGUOUS")]
     by_grade: dict[str, dict[str, Any]] = {}
     for g in ("A", "B", "C"):
@@ -223,7 +307,7 @@ def aggregate() -> dict[str, Any]:
     }
 
 
-def timing_calibration() -> dict[str, Any]:
+def timing_calibration(path: Optional[str] = None) -> dict[str, Any]:
     """Historical time-to-target calibration from resolved WIN entries.
 
     For every WIN with a recorded bars_to_resolve, compare against the
@@ -236,8 +320,9 @@ def timing_calibration() -> dict[str, Any]:
     measures HOW FAST targets are reached when they ARE reached - it does not
     (and must not) restate the hit rate, which lives in aggregate().
     Per-grade splits are included when each grade clears MIN_SAMPLE_FOR_RATE.
+    path=None -> live ledger (unchanged); explicit reads are allowed.
     """
-    records = _read_all()
+    records = _read_all() if path is None else _read_all(path)
 
     def _samples(rs: list[dict]) -> list[tuple[float, float]]:
         out = []
@@ -279,18 +364,18 @@ def timing_calibration() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Evaluator + look-ahead-safe cold-start seeder (LLM Council, May 23 2026)
 # ---------------------------------------------------------------------------
-async def evaluate_open_entries(service: Any) -> dict[str, int]:  # <- NEW [autoeval]: serialized public entry
+async def evaluate_open_entries(service: Any, *, path: Optional[str] = None) -> dict[str, int]:  # <- NEW [autoeval]: serialized public entry
     """Serialize evaluation via _EVAL_LOCK so the background auto-evaluator and a
     manual ?evaluate=true call never interleave their read-modify-write of the
     ledger; records the last-eval timestamp for the aggregate report."""
     global _LAST_EVAL_TS
     async with _EVAL_LOCK:
-        result = await _evaluate_open_entries_impl(service)
+        result = await _evaluate_open_entries_impl(service, path=path)
     _LAST_EVAL_TS = datetime.now(timezone.utc).isoformat(timespec="seconds")
     return result
 
 
-async def _evaluate_open_entries_impl(service: Any) -> dict[str, int]:
+async def _evaluate_open_entries_impl(service: Any, *, path: Optional[str] = None) -> dict[str, int]:
     """Resolve PENDING ledger entries against subsequent DAILY bars.
 
     Look-ahead-safe: only bars strictly AFTER the setup date are considered.
@@ -298,7 +383,8 @@ async def _evaluate_open_entries_impl(service: Any) -> dict[str, int]:
     horizon of bars has elapsed - so a live setup logged today is never
     prematurely marked EXPIRED. Never raises per entry. Persists once."""
     from datetime import date as _date
-    records = _read_all()
+    target = _resolve_ledger(path, writing=True)   # resolve ONCE: read and
+    records = _read_all(target)                    # rewrite must never diverge
     if not records:
         return {"evaluated": 0, "resolved": 0, "still_pending": 0}
     resolved_count = 0
@@ -340,20 +426,25 @@ async def _evaluate_open_entries_impl(service: Any) -> dict[str, int]:
             logger.warning("evaluate: classify failed for %s: %s", symbol, exc)
             still_pending += 1
             continue
-        if outcome == "EXPIRED" and len(future) < horizon:
-            # Not enough subsequent bars yet to declare expiry - stay honest.
+        if (outcome == "EXPIRED"
+                and usable_bar_count(fut_highs, fut_lows, horizon) < horizon):
+            # Not enough USABLE subsequent bars to declare expiry - stay honest.
+            # len(future) counted bars the PROVIDER RETURNED, including ones
+            # classify() refused to read; expiring on those asserts an outcome
+            # from evidence we never had.
             still_pending += 1
             continue
         rec["outcome"] = outcome
         rec["bars_to_resolve"] = bars
         rec["resolved_on"] = datetime.now(timezone.utc).date().isoformat()
         resolved_count += 1
-    _rewrite(records)
+    _rewrite(records, target)
     return {"evaluated": len(records), "resolved": resolved_count, "still_pending": still_pending}
 
 
 async def backfill_seed(service: Any, universe: list[tuple[str, str, str]],
-                        as_of_dates: list[str]) -> dict[str, int]:
+                        as_of_dates: list[str], *,
+                        path: Optional[str] = None) -> dict[str, int]:
     """Look-ahead-safe cold-start seeding.
 
     For each (symbol, region, asset_class) and each PAST as_of date, score the
@@ -362,6 +453,7 @@ async def backfill_seed(service: Any, universe: list[tuple[str, str, str]],
     evaluate_open_entries (single classification path). Never raises per item."""
     from datetime import date as _date
     from .setup_scanner import score_setup
+    _resolve_ledger(path, writing=True)   # fail fast BEFORE any fetch work
     logged = 0
     skipped = 0
     for symbol, region, asset_class in universe:
@@ -399,6 +491,6 @@ async def backfill_seed(service: Any, universe: list[tuple[str, str, str]],
                 continue
             rec = dict(setup)
             rec["source"] = getattr(series, "source", "?")
-            if log_setup(rec, date_iso=as_of):
+            if log_setup(rec, date_iso=as_of, path=path):
                 logged += 1
     return {"logged": logged, "skipped": skipped}
