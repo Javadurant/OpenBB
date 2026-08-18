@@ -29,7 +29,9 @@ import json
 import logging
 import math
 import os
+import re
 import threading
+from functools import lru_cache
 from datetime import datetime, timezone
 from typing import Any, Final, Optional, TypedDict
 
@@ -40,6 +42,147 @@ LIVE_LEDGER_PATH: Final = _LEDGER_PATH   # public: for identity checks by tools/
 MIN_SAMPLE_FOR_RATE: Final = 5      # below this, report "insufficient data"
 MIN_BARS_TO_SCORE:   Final = 60     # need history depth before an as_of to score
 DEFAULT_WINDOW_DAYS: Final = 18     # fallback horizon if a window can't be parsed
+
+# ── Calibration eligibility (ADDITIVE - v3) ─────────────────────────────────
+# A row can be present in the ledger (immutable audit history) and still be
+# unfit to inform PERFORMANCE statistics. Two disjoint, evidence-based reasons;
+# neither mutates, deletes or re-outcomes anything.
+#
+#  (1) STRUCTURAL - the stored geometry is impossible for a long setup. Derived
+#      from the row itself: no external data, no threshold.
+#  (2) PROVENANCE - the stored OUTCOME was produced by a structurally invalid
+#      provider bar. Enumerated explicitly in the tracked manifest, each key
+#      bound to an archived evidence file + sha256, never inferred from a
+#      stop-distance threshold - no such threshold is defensible.
+#
+# CONTRACT (v3): every pre-existing field keeps its ALL-RECORD meaning, byte for
+# byte. Eligibility is exposed ONLY through new, explicitly named *_eligible
+# fields. Consumers opt in; nothing they already read changes underneath them.
+#
+# The manifest is DATA, not code, so its evidence hashes can be verified by a
+# test. It loads from TRACKED source - never /tmp, never the untracked local
+# audit archive: runtime must not depend on a local artifact.
+_POLICY_PATH: Final = os.path.join(
+    os.path.dirname(__file__), "policy", "calibration_eligibility_v1.json")
+
+_STRUCTURAL_REASON: Final = "impossible_geometry"
+_PROVENANCE_REASON: Final = "false_resolution_malformed_bar"
+_SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$")
+
+
+@lru_cache(maxsize=1)
+def _calibration_policy() -> dict[str, Any]:
+    """Load the eligibility manifest once.
+
+    FAIL-SAFE AND ALL-OR-NOTHING. Any problem - missing file, unreadable, bad
+    JSON, wrong shape, duplicate key, malformed sha256, missing field - logs an
+    error and returns an EMPTY policy, so every row stays ELIGIBLE and the
+    *_eligible fields simply equal their all-record counterparts. Entries are
+    staged and committed only after the WHOLE manifest validates, so one bad
+    record can never partially apply. Failing closed onto an unverified
+    exclusion set would silently shrink a published track record.
+
+    Tests must call _calibration_policy.cache_clear() after touching the file."""
+    try:
+        with open(_POLICY_PATH, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        version = doc["policy_version"]
+        entries = doc["provenance_rule"]["keys"]
+        if not isinstance(version, str) or not version:
+            raise ValueError("policy_version must be a non-empty string")
+        if not isinstance(entries, list):
+            raise ValueError("provenance_rule.keys must be a list")
+        staged: dict[str, dict[str, Any]] = {}
+        for e in entries:
+            key = e["key"]
+            if key in staged:
+                raise ValueError(f"duplicate key in manifest: {key}")
+            if e["reason"] != _PROVENANCE_REASON:
+                raise ValueError(f"{key}: unexpected reason {e['reason']!r}")
+            if not _SHA256_RE.match(str(e["evidence_sha256"])):
+                raise ValueError(f"{key}: malformed evidence_sha256")
+            for field in ("classification", "evidence_file", "audit_date"):
+                if not str(e.get(field, "")).strip():
+                    raise ValueError(f"{key}: missing {field}")
+            staged[key] = e
+        return {"policy_version": version, "keys": staged}   # committed only here
+    except Exception:  # noqa: BLE001 - fail OPEN, never closed, never partial
+        logger.error("calibration eligibility policy unusable at %s - treating "
+                     "every row as eligible", _POLICY_PATH, exc_info=True)
+        return {"policy_version": None, "keys": {}}
+
+
+def _geometry_sound(rec: dict) -> bool:
+    """True when the stored levels are a possible long setup: all finite and
+    0 < stop < entry < target. Mirrors the scanner emission gate, so a row
+    today's scanner would refuse cannot inform performance statistics."""
+    try:
+        entry = float(rec["entry"])
+        stop = float(rec["stop"])
+        target = float(rec["target"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not all(math.isfinite(v) for v in (entry, stop, target)):
+        return False
+    return 0.0 < stop < entry < target
+
+
+def calibration_ineligible_reason(rec: dict) -> Optional[str]:
+    """Why this row must not inform performance statistics, or None if it may.
+    Pure: never mutates the record."""
+    if not _geometry_sound(rec):
+        return _STRUCTURAL_REASON
+    if rec.get("key") in _calibration_policy()["keys"]:
+        return _PROVENANCE_REASON
+    return None
+
+
+def partition_eligibility(records: list[dict]) -> tuple[list[dict], list[tuple[dict, str]]]:
+    """Split into (eligible, [(record, reason), ...]) in ONE pass.
+
+    Deliberately NOT keyed by rec['key']: a dict keyed that way would silently
+    collapse - and over-exclude - if two rows ever shared a key."""
+    eligible: list[dict] = []
+    ineligible: list[tuple[dict, str]] = []
+    for rec in records:
+        reason = calibration_ineligible_reason(rec)
+        (ineligible.append((rec, reason)) if reason else eligible.append(rec))
+    return eligible, ineligible
+
+
+def _eligibility_meta(ineligible: list[tuple[dict, str]]) -> dict[str, Any]:
+    """Exclusion disclosure attached to every payload that reports *_eligible
+    figures. An exclusion the caller cannot see is indistinguishable from a bug."""
+    by_reason: dict[str, int] = {}
+    for _rec, reason in ineligible:
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    return {
+        "eligibility_policy_version": _calibration_policy()["policy_version"],
+        "excluded_ineligible": len(ineligible),
+        "excluded_by_reason": dict(sorted(by_reason.items())),
+    }
+
+
+def _outcome_stats(rs: list[dict]) -> dict[str, Any]:
+    """Win/loss/expiry counts, win rate and expectancy for one row set.
+    Arithmetic is identical to the pre-v3 inline computation."""
+    wins = sum(1 for r in rs if r.get("outcome") == "WIN")
+    losses = sum(1 for r in rs if r.get("outcome") in ("LOSS", "AMBIGUOUS"))
+    pending = sum(1 for r in rs if r.get("outcome") == "PENDING")
+    expired = sum(1 for r in rs if r.get("outcome") == "EXPIRED")
+    decided = wins + losses
+    rate = round(100.0 * wins / decided, 1) if decided > 0 else None
+    rr_vals = [r.get("reward_risk") for r in rs
+               if isinstance(r.get("reward_risk"), (int, float)) and r.get("reward_risk")]
+    avg_rr = round(sum(rr_vals) / len(rr_vals), 2) if rr_vals else None
+    expectancy = None
+    if decided > 0 and avg_rr is not None:
+        wr = wins / decided
+        expectancy = round(wr * avg_rr - (1.0 - wr) * 1.0, 3)
+    return {"logged": len(rs), "wins": wins, "losses": losses, "expired": expired,
+            "pending": pending, "decided": decided, "win_rate_pct": rate,
+            "avg_reward_risk": avg_rr, "expectancy_r": expectancy}
+
 _WRITE_LOCK: Final = threading.Lock()  # guards append + rewrite against concurrent scan workers
 _EVAL_LOCK: Final = asyncio.Lock()      # <- NEW [autoeval]: serialize evaluate (bg loop + manual endpoint)
 _LAST_EVAL_TS: Optional[str] = None      # <- NEW [autoeval]: last evaluation time (UTC ISO), surfaced in aggregate()
@@ -261,36 +404,51 @@ def aggregate(path: Optional[str] = None) -> dict[str, Any]:
     path=None -> live ledger (unchanged); explicit reads are allowed."""
     records = _read_all() if path is None else _read_all(path)
     resolved = [r for r in records if r.get("outcome") in ("WIN", "LOSS", "AMBIGUOUS")]
+    # v3: eligibility is REPORTED ALONGSIDE, never substituted. `records` stays
+    # the all-record population for every pre-existing field.
+    eligible, ineligible = partition_eligibility(records)
+    resolved_eligible = [r for r in eligible
+                         if r.get("outcome") in ("WIN", "LOSS", "AMBIGUOUS")]
+    excluded_by_grade: dict[str, int] = {}
+    for rec, _reason in ineligible:
+        gr = rec.get("grade")
+        if gr:
+            excluded_by_grade[gr] = excluded_by_grade.get(gr, 0) + 1
     by_grade: dict[str, dict[str, Any]] = {}
     for g in ("A", "B", "C"):
         rs = [r for r in records if r.get("grade") == g]
-        wins = sum(1 for r in rs if r.get("outcome") == "WIN")
-        losses = sum(1 for r in rs if r.get("outcome") in ("LOSS", "AMBIGUOUS"))
-        pending = sum(1 for r in rs if r.get("outcome") == "PENDING")
-        expired = sum(1 for r in rs if r.get("outcome") == "EXPIRED")
-        decided = wins + losses
-        rate = round(100.0 * wins / decided, 1) if decided > 0 else None
-        rr_vals = [r.get("reward_risk") for r in rs
-                   if isinstance(r.get("reward_risk"), (int, float)) and r.get("reward_risk")]
-        avg_rr = round(sum(rr_vals) / len(rr_vals), 2) if rr_vals else None
-        # Expectancy in R: win% * avg_reward - loss% * 1 (risk is 1R by definition).
-        expectancy = None
-        if decided > 0 and avg_rr is not None:
-            wr = wins / decided
-            expectancy = round(wr * avg_rr - (1.0 - wr) * 1.0, 3)
+        all_stats = _outcome_stats(rs)
+        eligible_stats = _outcome_stats([r for r in eligible if r.get("grade") == g])
+        decided = all_stats["decided"]
         by_grade[g] = {
-            "logged": len(rs), "wins": wins, "losses": losses,
-            "expired": expired, "pending": pending, "decided": decided,
-            "win_rate_pct": rate,
-            "avg_reward_risk": avg_rr,
-            "expectancy_r": expectancy,
+            # ── ALL-RECORD audit statistics: meaning UNCHANGED from pre-v3 ──
+            "logged": all_stats["logged"], "wins": all_stats["wins"],
+            "losses": all_stats["losses"], "expired": all_stats["expired"],
+            "pending": all_stats["pending"], "decided": decided,
+            "win_rate_pct": all_stats["win_rate_pct"],
+            "avg_reward_risk": all_stats["avg_reward_risk"],
+            "expectancy_r": all_stats["expectancy_r"],
             "rate_reliable": decided >= MIN_SAMPLE_FOR_RATE,
+            # ── ELIGIBILITY-ADJUSTED performance statistics: NEW, opt-in ──
+            "logged_eligible": eligible_stats["logged"],
+            "wins_eligible": eligible_stats["wins"],
+            "losses_eligible": eligible_stats["losses"],
+            "expired_eligible": eligible_stats["expired"],
+            "pending_eligible": eligible_stats["pending"],
+            "decided_eligible": eligible_stats["decided"],
+            "win_rate_pct_eligible": eligible_stats["win_rate_pct"],
+            "expectancy_r_eligible": eligible_stats["expectancy_r"],
+            "rate_reliable_eligible": eligible_stats["decided"] >= MIN_SAMPLE_FOR_RATE,
+            "excluded": excluded_by_grade.get(g, 0),
         }
     dates = sorted(r.get("date", "") for r in records if r.get("date"))
     return {
         "status": "ok",
-        "total_logged": len(records),
-        "total_resolved": len(resolved),
+        "total_logged": len(records),                 # ALL rows - meaning UNCHANGED
+        "total_resolved": len(resolved),              # ALL rows - meaning UNCHANGED
+        "total_eligible": len(eligible),
+        "total_resolved_eligible": len(resolved_eligible),
+        **_eligibility_meta(ineligible),
         "last_evaluated": _LAST_EVAL_TS,  # <- NEW [autoeval]: null until first eval this process
         "by_grade": by_grade,
         "date_range": {"from": dates[0], "to": dates[-1]} if dates else None,
@@ -301,7 +459,14 @@ def aggregate(path: Optional[str] = None) -> dict[str, Any]:
             "Look-ahead-safe (setups scored using only data up to their date). "
             "Each setup targets a fixed reward:risk, so win rate must be read with "
             "expectancy_r (expected R-multiple per setup): positive expectancy can "
-            "coexist with a sub-50% win rate."
+            "coexist with a sub-50% win rate. EVERY field above reports the "
+            "ALL-RECORD population and is unchanged. The parallel *_eligible "
+            "fields additionally report performance over rows that remain "
+            "CALIBRATION-ELIGIBLE: rows whose stored geometry is impossible, or "
+            "whose outcome was produced by a structurally invalid provider bar, "
+            "are withheld there and counted in excluded_by_reason. Excluded rows "
+            "stay in the ledger as immutable audit history; nothing is deleted, "
+            "rewritten or re-outcomed."
         ),
         "disclaimer": "Decision-support, not advice. Past results do not predict future performance.",
     }
@@ -354,10 +519,19 @@ def timing_calibration(path: Optional[str] = None) -> dict[str, Any]:
     overall["by_grade"] = {
         g: _stats(_samples([r for r in records if r.get("grade") == g]))
         for g in ("A", "B", "C")}
+    # v3: calibration metrics are computed over the FULL record set exactly as
+    # before - bit-identical. The eligibility policy is DISCLOSED here so the
+    # same metadata travels with both payloads, but it does not filter: no WIN
+    # is currently excluded, so filtering would be a no-op that only risked
+    # perturbing a published constant.
+    _eligible_unused, _ineligible = partition_eligibility(records)
+    overall.update(_eligibility_meta(_ineligible))
     overall["methodology"] = (
         "WIN-only calibration on first-touch resolutions: speed_factor is the "
         "median of actual-bars-to-target over predicted-base-case days. It "
-        "rescales future base-case estimates; it says nothing about hit rate.")
+        "rescales future base-case estimates; it says nothing about hit rate. "
+        "Metrics here cover ALL records and are unchanged by the eligibility "
+        "policy; excluded_by_reason is reported for transparency only.")
     return overall
 
 
