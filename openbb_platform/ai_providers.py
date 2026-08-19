@@ -46,7 +46,7 @@ def _reg() -> dict[str, Provider]:
     """Build the registry at call time so OLLAMA_BASE_URL / *_MODEL env overrides
     are always honoured regardless of import order."""
     return {
-        "groq":      Provider("groq",      "https://api.groq.com/openai/v1",        "GROQ_API_KEY",      os.getenv("GROQ_MODEL",      "llama-3.3-70b-versatile")),
+        "groq":      Provider("groq",      "https://api.groq.com/openai/v1",        "GROQ_API_KEY",      os.getenv("GROQ_MODEL",      "openai/gpt-oss-20b")),
         "fireworks": Provider("fireworks", "https://api.fireworks.ai/inference/v1", "FIREWORKS_API_KEY", os.getenv("FIREWORKS_MODEL", "accounts/fireworks/models/gpt-oss-120b")),
         "together":  Provider("together",  "https://api.together.xyz/v1",           "TOGETHER_API_KEY",  os.getenv("TOGETHER_MODEL",  "meta-llama/Llama-3.3-70B-Instruct-Turbo")),
         "deepinfra": Provider("deepinfra", "https://api.deepinfra.com/v1/openai",   "DEEPINFRA_API_KEY", os.getenv("DEEPINFRA_MODEL", "meta-llama/Llama-3.3-70B-Instruct")),

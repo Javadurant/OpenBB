@@ -119,7 +119,7 @@ def ai_analyze(prompt: str, model: str = "groq", max_tokens: int = 1024) -> str:
     if model == "groq" and cfg.GROQ_API_KEY:
         client = groq_client()
         resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=max_tokens,

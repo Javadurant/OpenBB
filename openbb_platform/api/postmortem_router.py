@@ -11,7 +11,7 @@ Two phases:
      `hit_target`, `hit_stop`. These facts are derived solely from the
      numeric inputs and never come from the LLM.
 
-  2. Narrative synthesis — Groq (llama-3.3-70b-versatile, the existing
+  2. Narrative synthesis — Groq (openai/gpt-oss-20b, the existing
      project default) writes structured `what_worked` / `what_failed` /
      `lessons_learned` arrays plus a one-paragraph `synthesis`. The LLM
      is given the pre-classified facts so its commentary cannot
@@ -248,7 +248,7 @@ def llm_narrative(req: PostmortemRequest, facts: dict[str, Any]) -> dict[str, li
             user_postmortem=(req.user_postmortem or "").strip() or "(none)",
         )
         resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
             max_tokens=600,
