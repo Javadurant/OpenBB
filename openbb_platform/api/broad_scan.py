@@ -186,6 +186,11 @@ def broad_scan(
         discover_fn=discover_fn, screener_fn=screener_fn)
 
     scored: list[dict] = []
+    # Every shortlisted entry either grades or is dropped. Both drop paths used
+    # to be invisible: the raise was logged at DEBUG (the service runs at INFO)
+    # and the None return was not logged at all, so `eligible - capped_out`
+    # never reconciled with `scanned` and no caller could see why.
+    drops: dict[str, int] = {"score_error": 0, "no_result": 0}
     if entries:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(score_fn, e, calibration=calibration,
@@ -195,10 +200,16 @@ def broad_scan(
                 try:
                     r = f.result()
                 except Exception as exc:  # noqa: BLE001 - one bad symbol never sinks the scan
-                    logger.debug("broad-scan score error: %s", type(exc).__name__)
+                    drops["score_error"] += 1
+                    logger.warning("broad-scan score error: %s", type(exc).__name__)
                     r = None
                 if r is not None:
                     scored.append(r)
+                else:
+                    drops["no_result"] += 1
+    # score_error rows are counted in BOTH buckets by construction (a raise also
+    # yields no result), so subtract to keep the funnel additive.
+    drops["no_result"] -= drops["score_error"]
 
     scored.sort(key=lambda r: (_GRADE_RANK.get(r.get("grade"), 9),
                                -(r.get("score") or 0.0), r.get("symbol") or ""))
@@ -217,7 +228,9 @@ def broad_scan(
         "discovery_label": meta["discovery_label"],  # full_exchange_market / key_missing / …
         "screener_liquid": meta["screener_liquid"],  # names with bulk liquidity data
         "eligible": meta["eligible"],                # passed the (zero) liquidity prefilters
+        "shortlisted": meta["shortlisted"],          # handed to the scorer
         "scanned": len(scored),                      # actually graded by setup_scanner
+        "dropped": drops,                            # shortlisted - scanned, by cause
         "capped_out": meta["capped_out"],
         "excluded": meta["excluded"],
         "grade_a_count": len(grade_a),
