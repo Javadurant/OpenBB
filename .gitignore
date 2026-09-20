@@ -64,3 +64,17 @@ build/conda/tmp
 
 # Accidental nested clone (SENTRIQ, 2026-07-26)
 /OpenBB/
+
+# 2026-09-20 (SENTRIQ session R) — ONE OWNER PER FILE.
+# The SENTRIQ engine lives in the NESTED repo openbb_platform/ (remote: quantedge-platform).
+# This outer fork also tracked 181 stale copies of the same files: on 2026-09-20 its committed
+# setup_scanner.py was 85 lines behind the working tree and setup_ledger.py 200 lines behind, so a
+# `git checkout`/`git restore`/`git stash pop` HERE would have silently reverted live engine logic
+# by a month, with no engine-fingerprint change until the next scan. Untracked here; the nested
+# repo remains the sole owner. Do not re-add these paths to this repository.
+openbb_platform/api/
+openbb_platform/engine/
+openbb_platform/ta_engine/
+openbb_platform/pages/
+openbb_platform/ui_components/
+openbb_platform/news_reference/
